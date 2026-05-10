@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#f4f1ea" />
+  <meta name="description" content="freemetro — a minimalist transit puzzle." />
+  <title>freemetro</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Game canvas -->
+  <canvas id="canvas" aria-label="freemetro map"></canvas>
+
+  <!-- Top HUD -->
+  <header id="hud" class="hidden">
+    <div class="hud-left">
+      <div class="hud-clock">
+        <span id="hud-day">MON</span>
+        <span id="hud-time">06:00</span>
+      </div>
+      <div class="hud-stat" title="Passengers delivered">
+        <span class="stat-label">delivered</span>
+        <span class="stat-value" id="hud-score">0</span>
+      </div>
+      <div class="hud-stat" title="Current city">
+        <span class="stat-label">city</span>
+        <span class="stat-value" id="hud-city">—</span>
+      </div>
+      <div class="hud-stat hud-mode" title="Game mode">
+        <span class="stat-label">mode</span>
+        <span class="stat-value" id="hud-mode">—</span>
+      </div>
+    </div>
+
+    <div class="hud-right">
+      <button id="btn-pause" class="hud-btn" aria-label="Pause">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <rect x="7" y="5" width="3.5" height="14" />
+          <rect x="13.5" y="5" width="3.5" height="14" />
+        </svg>
+      </button>
+      <button id="btn-speed" class="hud-btn" aria-label="Speed">
+        <span id="speed-label">1×</span>
+      </button>
+      <button id="btn-menu" class="hud-btn" aria-label="Menu">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <rect x="4" y="6" width="16" height="1.6" />
+          <rect x="4" y="11.2" width="16" height="1.6" />
+          <rect x="4" y="16.4" width="16" height="1.6" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Asset tray (lines + bridges/tunnels + trains/carriages) -->
+  <aside id="tray" class="hidden">
+    <div class="tray-section" id="tray-lines"></div>
+    <div class="tray-section" id="tray-assets"></div>
+  </aside>
+
+  <!-- Pause / menu overlay during game -->
+  <div id="pause-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <h2 class="overlay-title">paused</h2>
+      <button class="menu-btn" data-action="resume">resume</button>
+      <button class="menu-btn" data-action="restart">restart</button>
+      <button class="menu-btn" data-action="quit">quit to menu</button>
+    </div>
+  </div>
+
+  <!-- Weekly upgrade chooser -->
+  <div id="upgrade-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <h2 class="overlay-title">end of week</h2>
+      <p class="overlay-sub" id="upgrade-sub">choose an upgrade</p>
+      <div id="upgrade-options"></div>
+    </div>
+  </div>
+
+  <!-- Game over -->
+  <div id="gameover-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <h2 class="overlay-title">game over</h2>
+      <p class="overlay-sub" id="gameover-reason">a station was overcrowded for too long.</p>
+      <div class="result-stats">
+        <div><span class="stat-label">delivered</span><span class="stat-value" id="result-score">0</span></div>
+        <div><span class="stat-label">days</span><span class="stat-value" id="result-days">0</span></div>
+        <div><span class="stat-label">stations</span><span class="stat-value" id="result-stations">0</span></div>
+      </div>
+      <button class="menu-btn" data-action="restart">play again</button>
+      <button class="menu-btn" data-action="quit">quit to menu</button>
+    </div>
+  </div>
+
+  <!-- Main menu -->
+  <main id="menu" class="overlay">
+    <div class="menu-wrap">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 100 100" width="68" height="68" aria-hidden="true">
+            <line x1="31" y1="39" x2="50" y2="60" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
+            <line x1="78" y1="38" x2="50" y2="60" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
+            <circle cx="22" cy="28" r="11" fill="#f4f1ea" stroke="currentColor" stroke-width="6"/>
+            <rect x="66" y="14" width="24" height="24" fill="#f4f1ea" stroke="currentColor" stroke-width="6"/>
+            <polygon points="50,60 78,88 22,88" fill="#f4f1ea" stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h1 class="brand-title">freemetro</h1>
+        <p class="brand-sub">a small transit puzzle</p>
+      </div>
+
+      <nav class="menu-nav">
+        <button class="menu-btn primary" data-action="play">play</button>
+        <button class="menu-btn" data-action="cities">choose city</button>
+        <button class="menu-btn" data-action="modes">game mode</button>
+        <button class="menu-btn" data-action="stats">statistics</button>
+        <button class="menu-btn ghost" data-action="how">how to play</button>
+      </nav>
+
+      <footer class="menu-foot">
+        <span id="menu-current">—</span>
+      </footer>
+    </div>
+  </main>
+
+  <!-- City picker -->
+  <div id="cities-overlay" class="overlay hidden">
+    <div class="overlay-card wide">
+      <h2 class="overlay-title">choose a city</h2>
+      <div id="city-grid" class="city-grid"></div>
+      <button class="menu-btn ghost" data-action="back">back</button>
+    </div>
+  </div>
+
+  <!-- Mode picker -->
+  <div id="modes-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <h2 class="overlay-title">game mode</h2>
+      <div id="mode-grid" class="mode-grid">
+        <button class="mode-card" data-mode="normal">
+          <span class="mode-name">normal</span>
+          <span class="mode-desc">survive overcrowding. weekly upgrades.</span>
+        </button>
+        <button class="mode-card" data-mode="extreme">
+          <span class="mode-name">extreme</span>
+          <span class="mode-desc">no edits. no removals. unlock per city.</span>
+        </button>
+        <button class="mode-card" data-mode="endless">
+          <span class="mode-name">endless</span>
+          <span class="mode-desc">no game over. upgrades earned by ridership.</span>
+        </button>
+        <button class="mode-card" data-mode="creative">
+          <span class="mode-name">creative</span>
+          <span class="mode-desc">place stations, unlimited assets.</span>
+        </button>
+      </div>
+      <button class="menu-btn ghost" data-action="back">back</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div id="stats-overlay" class="overlay hidden">
+    <div class="overlay-card wide">
+      <h2 class="overlay-title">statistics</h2>
+      <div id="stats-content"></div>
+      <button class="menu-btn ghost" data-action="reset-stats">reset all data</button>
+      <button class="menu-btn ghost" data-action="back">back</button>
+    </div>
+  </div>
+
+  <!-- How to play -->
+  <div id="how-overlay" class="overlay hidden">
+    <div class="overlay-card wide">
+      <h2 class="overlay-title">how to play</h2>
+      <div class="how-content">
+        <p><strong>connect.</strong> drag from one station to another to start a line. drag from a line endpoint to extend.</p>
+        <p><strong>deliver.</strong> passengers (small shapes) want the station shape they wear. trains pick up and drop along your lines.</p>
+        <p><strong>survive.</strong> if a station stays overcrowded too long, it's game over. tap a station to inspect.</p>
+        <p><strong>edit.</strong> drag the small grip on a line endpoint to reroute (not in extreme mode). long-press a line segment to delete the line.</p>
+        <p><strong>cross water.</strong> tunnels &amp; bridges are required to cross rivers. they are limited.</p>
+        <p><strong>weekly.</strong> at the start of each week you choose an upgrade: a new line, a train, a carriage, an interchange, or tunnels.</p>
+      </div>
+      <button class="menu-btn ghost" data-action="back">back</button>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="game.js" defer></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
