@@ -535,6 +535,57 @@ body::before {
 .how-content p { margin-bottom: 10px; }
 .how-content strong { color: var(--ink); font-weight: 500; }
 
+/* ===== pause banner (non-blocking) ===== */
+.pause-banner {
+  position: fixed;
+  top: 0; left: 50%;
+  transform: translateX(-50%) translateY(0);
+  margin-top: calc(56px + env(safe-area-inset-top, 0px));
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px;
+  background: var(--ink);
+  color: var(--paper);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  z-index: 15;
+  animation: pauseBannerIn 0.2s ease-out;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.18);
+}
+@keyframes pauseBannerIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+.pause-banner-text {
+  white-space: nowrap;
+}
+.pause-banner-btn {
+  background: var(--paper);
+  color: var(--ink);
+  border: none;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.pause-banner-btn:hover { background: var(--paper-edge); }
+.pause-banner-btn.ghost {
+  background: transparent;
+  color: var(--paper);
+  border: 1px solid var(--paper);
+}
+.pause-banner-btn.ghost:hover { background: rgba(244,241,234,0.15); }
+@media (max-width: 700px) {
+  .pause-banner { font-size: 9.5px; padding: 6px 10px; gap: 6px; }
+  .pause-banner-text { font-size: 9.5px; }
+  .pause-banner-btn { font-size: 9px; padding: 4px 9px; }
+}
+
 /* ===== toast ===== */
 .toast {
   position: fixed;
@@ -562,8 +613,14 @@ body::before {
   .city-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
   .mode-grid { grid-template-columns: 1fr; }
 
-  /* HUD: keep only clock, cash, score on mobile; hide city + mode */
-  #hud { padding: 8px 10px; }
+  /* HUD: keep only clock, cash, score on mobile; hide city + mode.
+     Lift padding by the safe-area inset so notches / Dynamic Island don't
+     swallow the clock on iOS. Add a subtle paper-coloured backdrop so the
+     HUD stays readable but the map shows through. */
+  #hud {
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 10px 8px;
+    background: linear-gradient(to bottom, rgba(244,241,234,0.92), rgba(244,241,234,0));
+  }
   .hud-left { gap: 10px; }
   .hud-right { gap: 4px; }
   .hud-stat.hud-mode,
@@ -575,11 +632,11 @@ body::before {
   }
   .stat-value { font-size: 16px; }
 
-  /* tray: compact and allow asset chips to wrap */
+  /* tray: compact, allow asset chips to wrap, push above iOS home indicator */
   #tray {
     gap: 8px;
     padding: 6px 10px;
-    bottom: 10px;
+    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
     max-width: calc(100vw - 16px);
     flex-wrap: wrap;
     justify-content: center;
@@ -589,6 +646,10 @@ body::before {
   .tray-section + .tray-section { padding-left: 8px; }
   .asset-chip { font-size: 10px; padding: 3px 8px; }
   .line-chip { width: 22px; height: 22px; }
+
+  /* Bigger station hit area on touch devices: stations are visually 13px
+     but the touch target effectively matches the 22px HIT_RADIUS in JS.
+     This is enforced in the canvas hit-detection code. */
 
   .result-stats { grid-template-columns: repeat(2, 1fr); }
   .menu-btn { padding: 14px 18px; }   /* bigger touch target */

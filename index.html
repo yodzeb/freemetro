@@ -75,14 +75,11 @@
     <div class="tray-section" id="tray-assets"></div>
   </aside>
 
-  <!-- Pause / menu overlay during game -->
-  <div id="pause-overlay" class="overlay hidden">
-    <div class="overlay-card">
-      <h2 class="overlay-title">paused</h2>
-      <button class="menu-btn" data-action="resume">resume</button>
-      <button class="menu-btn" data-action="restart">restart</button>
-      <button class="menu-btn" data-action="quit">quit to menu</button>
-    </div>
+  <!-- Pause indicator (slim, non-blocking — keep editing while paused) -->
+  <div id="pause-banner" class="pause-banner hidden">
+    <span class="pause-banner-text">paused — redesign your network</span>
+    <button class="pause-banner-btn" data-action="resume">resume</button>
+    <button class="pause-banner-btn ghost" data-action="quit">quit</button>
   </div>
 
   <!-- Shop overlay (open at any time during play) -->

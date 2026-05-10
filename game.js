@@ -53,12 +53,24 @@ const CFG = {
   HIT_RADIUS: 22,
   // station radius
   STATION_RADIUS: 13,
-  // map margin from edges (per-side, accounts for HUD top and tray bottom)
-  MAP_MARGIN: { top: 80, right: 50, bottom: 90, left: 50 },
   // station shape weights — common shapes are far more frequent
   COMMON_WEIGHT: 9,
   EXOTIC_STATION_WEIGHT: 2,
 };
+
+/* Per-edge map margins. Smaller on small screens so mobile users actually
+   see most of the play area. Computed dynamically from viewport size so the
+   spawn area scales to fit the visible chrome. */
+function mapMargin() {
+  const w = G.width  || 800;
+  const h = G.height || 600;
+  // narrow screens (<700px wide): tight margins; chrome is smaller anyway
+  if (w < 700) return { top: 56, right: 16, bottom: 70, left: 16 };
+  // medium
+  if (w < 1100) return { top: 70, right: 36, bottom: 80, left: 36 };
+  // desktop
+  return { top: 80, right: 50, bottom: 90, left: 50 };
+}
 
 // transit-line palette (names match css custom props order)
 const LINE_COLORS = [
@@ -247,7 +259,7 @@ function showToast(msg, ms = 1700) {
 
 function cityRiversCanvas() {
   if (!G.city) return [];
-  const M = CFG.MAP_MARGIN;
+  const M = mapMargin();
   const w = G.width  - M.left - M.right;
   const h = G.height - M.top  - M.bottom;
   return G.city.rivers.map(line => line.map(([nx, ny]) => ({ x: M.left + nx*w, y: M.top + ny*h })));
@@ -319,13 +331,13 @@ function pickPassengerShape(station) {
 
 /* Convert normalized [0..1] map coords to canvas pixels using current dimensions. */
 function mapToPx(nx, ny) {
-  const M = CFG.MAP_MARGIN;
+  const M = mapMargin();
   const w = G.width  - M.left - M.right;
   const h = G.height - M.top  - M.bottom;
   return { x: M.left + nx * w, y: M.top + ny * h };
 }
 function pxToMap(x, y) {
-  const M = CFG.MAP_MARGIN;
+  const M = mapMargin();
   const w = Math.max(1, G.width  - M.left - M.right);
   const h = Math.max(1, G.height - M.top  - M.bottom);
   return { nx: (x - M.left) / w, ny: (y - M.top) / h };
@@ -347,7 +359,7 @@ function relayoutStations() {
 
 function spawnStation(opts) {
   if (G.stations.length >= 50) return; // hard ceiling
-  const M = CFG.MAP_MARGIN;
+  const M = mapMargin();
   const pad = 20;
   // Sanity guard: if dimensions are not yet set, refuse to spawn (caller may
   // retry once the viewport is known). Prevents NaN/garbage station coords.
@@ -641,20 +653,45 @@ function grantAsset(kind) {
 }
 
 function autoAttachTrain() {
-  // find the line with the most waiting passengers and one or zero trains
-  const candidates = G.lines.map(line => {
-    const stations = lineStationPoints(line);
-    const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
-    const trains = G.trains.filter(t => t.lineId === line.id).length;
-    return { line, waiting, trains };
-  }).sort((a, b) => (b.waiting - b.trains * 4) - (a.waiting - a.trains * 4));
-  if (candidates[0]) {
-    addTrain(candidates[0].line.id);
-    G.assets.trainsAvailable--;
-    showToast('train assigned');
-  } else {
+  if (G.lines.length === 0) {
     showToast('+1 train (build a line first)');
+    return;
   }
+  // Rule 1: any line without a train? give it one (any line should run).
+  const trainless = G.lines.filter(l => !G.trains.some(t => t.lineId === l.id));
+  let target;
+  if (trainless.length > 0) {
+    // among trainless lines, pick the one with the most waiting passengers
+    target = trainless
+      .map(line => {
+        const stations = lineStationPoints(line);
+        const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
+        return { line, waiting };
+      })
+      .sort((a, b) => b.waiting - a.waiting)[0].line;
+  } else {
+    // All lines have at least one train: add a second to the busiest line,
+    // weighting by waiting passengers minus a small penalty per existing train
+    // so we don't pile every train on one line.
+    target = G.lines
+      .map(line => {
+        const stations = lineStationPoints(line);
+        const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
+        const trains = G.trains.filter(t => t.lineId === line.id).length;
+        return { line, score: waiting - trains * 4 };
+      })
+      .sort((a, b) => b.score - a.score)[0].line;
+  }
+  addTrain(target.id);
+  G.assets.trainsAvailable--;
+  showToast('train assigned');
+}
+
+/* Count distinct lines that pass through a station. */
+function linesThroughStation(stationId) {
+  let n = 0;
+  for (const line of G.lines) if (line.stations.includes(stationId)) n++;
+  return n;
 }
 
 function payForDelivery(shape) {
@@ -976,6 +1013,8 @@ function render() {
   const ctx = G.ctx;
   // keep stations in sync with current viewport size (they live in normalized space)
   relayoutStations();
+  // compute parallel-line offsets so multiple lines on the same A↔B segment render side-by-side
+  computeSegmentOffsets();
   ctx.clearRect(0, 0, G.width, G.height);
 
   drawWater(ctx);
@@ -989,8 +1028,51 @@ function render() {
   // station) is invisible, which on short drags makes the whole preview look
   // missing.
   if (G.drag && G.drag.kind === 'newline') drawDragPreview(ctx);
+  if (G.deletePrompt) drawDeletePrompt(ctx);
 
   if (G.mode.creative) drawCreativeHint(ctx);
+}
+
+/* Floating "delete this line" prompt rendered on canvas. Tracks its hit-rect
+   in G._deletePromptRect for the pointer handler to consume. */
+function drawDeletePrompt(ctx) {
+  const dp = G.deletePrompt;
+  if (!dp || !dp.line) return;
+  const padX = 14, padY = 10;
+  const labelText = 'delete line';
+  ctx.save();
+  ctx.font = '600 12px IBM Plex Mono, monospace';
+  const tw = ctx.measureText(labelText).width;
+  // pill: color swatch + text
+  const swatchW = 14;
+  const totalW = swatchW + 8 + tw + padX * 2;
+  const totalH = 24 + padY;
+  // position: above the tap point, clamped to viewport
+  let cx = dp.x;
+  let cy = dp.y - 30;
+  cy = Math.max(totalH / 2 + 8, cy);
+  cy = Math.min(G.height - totalH / 2 - 8, cy);
+  cx = Math.max(totalW / 2 + 8, cx);
+  cx = Math.min(G.width - totalW / 2 - 8, cx);
+  const left = cx - totalW / 2;
+  const top  = cy - totalH / 2;
+  // bg
+  roundRect(ctx, left, top, totalW, totalH, totalH / 2);
+  ctx.fillStyle = getCss('--ink');
+  ctx.fill();
+  // colour swatch (the line's colour)
+  ctx.fillStyle = dp.line.color;
+  ctx.beginPath();
+  ctx.arc(left + padX + swatchW / 2, top + totalH / 2, swatchW / 2, 0, Math.PI * 2);
+  ctx.fill();
+  // text
+  ctx.fillStyle = getCss('--paper');
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText(labelText, left + padX + swatchW + 8, top + totalH / 2);
+  ctx.restore();
+  // store hit rect for click detection
+  G._deletePromptRect = { x: left, y: top, w: totalW, h: totalH };
 }
 
 function drawWater(ctx) {
@@ -1021,20 +1103,90 @@ function drawWater(ctx) {
   ctx.restore();
 }
 
+/* Build a per-segment "shared lines" map. For each undirected segment
+   (stationA, stationB), tracks all lines that traverse it. Drawing code
+   uses this to space parallel lines side-by-side and put trains on the
+   correct offset rail. Recomputed each render frame (cheap). */
+function computeSegmentOffsets() {
+  const segMap = new Map();
+  function segKey(a, b) { return a < b ? `${a}:${b}` : `${b}:${a}`; }
+
+  for (const line of G.lines) {
+    const sids = line.stations;
+    for (let i = 0; i < sids.length - 1; i++) {
+      const k = segKey(sids[i], sids[i+1]);
+      if (!segMap.has(k)) segMap.set(k, []);
+      segMap.get(k).push(line.id);
+    }
+    if (line.loop && sids.length >= 2) {
+      const k = segKey(sids[sids.length - 1], sids[0]);
+      if (!segMap.has(k)) segMap.set(k, []);
+      segMap.get(k).push(line.id);
+    }
+  }
+  // sort each group by line slot for stable drawing order
+  for (const [, ids] of segMap) ids.sort((a, b) => {
+    const la = G.lines.find(l => l.id === a);
+    const lb = G.lines.find(l => l.id === b);
+    return (la ? la.slot : 0) - (lb ? lb.slot : 0);
+  });
+  G._segMap = segMap;
+}
+
+/* Get the perpendicular pixel offset for a given line on a given segment.
+   Positive offsets = perpendicular-right relative to segment direction A→B. */
+function lineOffsetForSegment(lineId, sidA, sidB) {
+  if (!G._segMap) return 0;
+  const k = sidA < sidB ? `${sidA}:${sidB}` : `${sidB}:${sidA}`;
+  const group = G._segMap.get(k);
+  if (!group || group.length <= 1) return 0;
+  const slot = group.indexOf(lineId);
+  if (slot < 0) return 0;
+  const total = group.length;
+  const LW = 6, GAP = 1;
+  return (slot - (total - 1) / 2) * (LW + GAP);
+}
+
 function drawLines(ctx) {
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.lineWidth = 6;
+
   for (const line of G.lines) {
+    const sids = line.stations;
     const pts = lineStationPoints(line);
     if (pts.length < 2) continue;
     ctx.strokeStyle = line.color;
-    ctx.beginPath();
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-    if (line.loop) ctx.lineTo(pts[0].x, pts[0].y);
-    ctx.stroke();
+
+    const segs = [];
+    for (let i = 0; i < pts.length - 1; i++) segs.push([i, i + 1]);
+    if (line.loop) segs.push([pts.length - 1, 0]);
+
+    for (const [i, j] of segs) {
+      const a = pts[i], b = pts[j];
+      const off = lineOffsetForSegment(line.id, sids[i], sids[j]);
+      if (off === 0) {
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      } else {
+        // Compute perpendicular from the CANONICAL segment direction (sorted
+        // by station id) so two lines traversing the same physical segment
+        // in opposite directions still get distinct, consistent offsets.
+        // Otherwise the perpendicular vector flips per-line and they overlap.
+        let canA = a, canB = b;
+        if (sids[i] > sids[j]) { canA = b; canB = a; }
+        const dx = canB.x - canA.x, dy = canB.y - canA.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const px = -dy / len, py = dx / len;
+        ctx.beginPath();
+        ctx.moveTo(a.x + px * off, a.y + py * off);
+        ctx.lineTo(b.x + px * off, b.y + py * off);
+        ctx.stroke();
+      }
+    }
   }
   ctx.restore();
 }
@@ -1322,8 +1474,20 @@ function drawTrains(ctx) {
 
     const a = pts[train.atIdx], b = pts[nextIdx];
     if (!a || !b) continue;
-    const x = a.x + (b.x - a.x) * train.pos;
-    const y = a.y + (b.y - a.y) * train.pos;
+
+    // perpendicular offset to align with the offset line on this segment.
+    // Use canonical (sorted-id) direction so opposite-traversal lines don't overlap.
+    const sidA = line.stations[train.atIdx];
+    const sidB = line.stations[nextIdx];
+    const off = lineOffsetForSegment(line.id, sidA, sidB);
+    let canA = a, canB = b;
+    if (sidA > sidB) { canA = b; canB = a; }
+    const dxs = canB.x - canA.x, dys = canB.y - canA.y;
+    const seglen = Math.hypot(dxs, dys) || 1;
+    const px = -dys / seglen, py = dxs / seglen;
+
+    const x = a.x + (b.x - a.x) * train.pos + px * off;
+    const y = a.y + (b.y - a.y) * train.pos + py * off;
     const angle = Math.atan2(b.y - a.y, b.x - a.x);
 
     ctx.save();
@@ -1464,13 +1628,37 @@ function setupInput() {
 }
 
 function onPointerDown(e) {
-  if (!G.running || G.paused) return;
+  if (!G.running) return;
+  // NOTE: paused is allowed — players can redesign their network while paused
   const p = pointerPos(e);
 
   // capture this pointer so move/up events keep firing on the canvas even if
   // the user drags the cursor off the canvas onto the HUD or tray.
   if (e.pointerId !== undefined) {
     try { G.canvas.setPointerCapture(e.pointerId); } catch {}
+  }
+
+  // FIRST: if a delete prompt is showing and the click hits it, confirm delete.
+  // If the click is outside, dismiss the prompt and continue handling normally.
+  if (G.deletePrompt && G._deletePromptRect) {
+    const r = G._deletePromptRect;
+    const hit = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+    if (hit) {
+      const lineToDelete = G.deletePrompt.line;
+      G.deletePrompt = null;
+      G._deletePromptRect = null;
+      if (G.lines.includes(lineToDelete)) {
+        deleteLine(lineToDelete);
+        showToast('line removed');
+      }
+      refreshTray();
+      if (G.ctx) render();
+      return;
+    } else {
+      // dismiss prompt; continue with normal hit testing
+      G.deletePrompt = null;
+      G._deletePromptRect = null;
+    }
   }
 
   // try line endpoint first (for extending)
@@ -1497,6 +1685,15 @@ function onPointerDown(e) {
       color: LINE_COLORS[slot % LINE_COLORS.length],
       cursorX: p.x, cursorY: p.y,
     };
+    return;
+  }
+
+  // empty space — record possible tap-on-line for deletion
+  const onLine = lineSegmentAt(p.x, p.y);
+  if (onLine && G.mode.canEdit) {
+    G._tapDown = { line: onLine, x: p.x, y: p.y, moved: false };
+  } else {
+    G._tapDown = null;
   }
 }
 
@@ -1510,6 +1707,10 @@ function onPointerMove(e) {
     // is throttled (e.g. background tab waking up, slow device).
     if (G.running && G.ctx) render();
   }
+  if (G._tapDown) {
+    const dx = p.x - G._tapDown.x, dy = p.y - G._tapDown.y;
+    if (dx*dx + dy*dy > 64) G._tapDown.moved = true;  // 8px tolerance
+  }
   G.hover = stationAt(p.x, p.y);
 }
 
@@ -1517,6 +1718,14 @@ function onPointerUp(e) {
   if (e && e.pointerId !== undefined) {
     try { G.canvas.releasePointerCapture(e.pointerId); } catch {}
   }
+  // Tap on a line (no drag started) → show delete prompt
+  if (!G.drag && G._tapDown && !G._tapDown.moved) {
+    G.deletePrompt = { line: G._tapDown.line, x: G._tapDown.x, y: G._tapDown.y };
+    G._tapDown = null;
+    if (G.running && G.ctx) render();
+    return;
+  }
+  G._tapDown = null;
   if (!G.drag) return;
   try {
     const p = pointerPos(e);
@@ -1582,9 +1791,9 @@ function onDoubleClick(e) {
 
 const SHOP_ITEMS = {
   line:        { name: 'New Line', desc: 'unlock another colour line' },
-  train:       { name: 'Train', desc: 'one extra locomotive' },
+  train:       { name: 'Train', desc: 'goes to a line that has none yet' },
   carriage:    { name: 'Carriage', desc: '+6 seats on busiest train' },
-  interchange: { name: 'Interchange', desc: '+capacity at busiest station' },
+  interchange: { name: 'Interchange', desc: '+capacity at biggest transfer hub' },
   crossing:    { name: 'Crossing', desc: 'bridge or tunnel for water' },
 };
 
@@ -1672,26 +1881,32 @@ function autoAttachCarriage() {
 }
 
 function autoApplyInterchange() {
-  // upgrade the most-busy station
-  const busiest = [...G.stations].sort((a, b) => b.passengers.length - a.passengers.length)[0];
-  if (busiest && !busiest.capacityBonus) {
-    busiest.capacityBonus += 6;
-    busiest.loadSpeedBonus += 0.5;
-    G.assets.interchanges--;
-    showToast('interchange placed');
-  } else if (busiest) {
-    // already has interchange — find next non-upgraded
-    const target = G.stations.filter(s => !s.capacityBonus).sort((a,b) => b.passengers.length - a.passengers.length)[0];
-    if (target) {
-      target.capacityBonus += 6;
-      target.loadSpeedBonus += 0.5;
-      G.assets.interchanges--;
-      showToast('interchange placed');
-    } else {
-      showToast('+1 interchange in inventory');
-    }
-  } else {
+  if (G.stations.length === 0) {
     showToast('+1 interchange');
+    return;
+  }
+  // Rank stations by (number of lines through it) DESC, then waiting passengers DESC.
+  // Skip stations that already have an interchange.
+  const candidates = G.stations
+    .filter(s => !s.capacityBonus)
+    .map(s => ({ s, lines: linesThroughStation(s.id), waiting: s.passengers.length }))
+    .sort((a, b) => (b.lines - a.lines) || (b.waiting - a.waiting));
+  if (candidates.length === 0) {
+    // Every station already has one — keep in inventory
+    showToast('+1 interchange in inventory');
+    return;
+  }
+  const top = candidates[0];
+  // If the top candidate isn't actually a transfer hub (only one line through),
+  // we still place it on the busiest unupgraded station — better than nothing,
+  // but the toast hints at the rationale.
+  top.s.capacityBonus += 6;
+  top.s.loadSpeedBonus += 0.5;
+  G.assets.interchanges--;
+  if (top.lines >= 2) {
+    showToast(`interchange placed on ${top.lines}-line hub`);
+  } else {
+    showToast('interchange placed');
   }
 }
 
@@ -1769,6 +1984,9 @@ function refreshHud() {
   document.getElementById('hud-day').textContent = days[dayIdx].toUpperCase();
   document.getElementById('hud-time').textContent =
     `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
+  // speed label — kept in sync with G.speed so restart resets the visual
+  const speedLabel = document.getElementById('speed-label');
+  if (speedLabel) speedLabel.textContent = G.speed + '×';
 }
 
 /* -------------------------------------------------------------
@@ -1792,7 +2010,7 @@ function spawnStarterStations() {
   }
   // Round 3: deterministic grid fallback. Can't fail.
   if (G.stations.length < N) {
-    const M = CFG.MAP_MARGIN;
+    const M = mapMargin();
     const pad = 20;
     const W = (G.width  && G.width  > 100) ? G.width  : 800;
     const H = (G.height && G.height > 100) ? G.height : 600;
@@ -1830,7 +2048,7 @@ function startGame(cityId, modeId) {
   document.getElementById('menu').classList.add('hidden');
   document.getElementById('hud').classList.remove('hidden');
   document.getElementById('tray').classList.remove('hidden');
-  document.getElementById('pause-overlay').classList.add('hidden');
+  document.getElementById('pause-banner').classList.add('hidden');
   document.getElementById('gameover-overlay').classList.add('hidden');
   document.getElementById('shop-overlay').classList.add('hidden');
 
@@ -1862,6 +2080,10 @@ function startGame(cityId, modeId) {
   G.victoryShown = false;
   G.speed = 1;
   G._netDirty = true;
+  G.drag = null;
+  G._tapDown = null;
+  G.deletePrompt = null;
+  G._deletePromptRect = null;
 
   // creative starts with no preset stations; player places them.
   // other modes: spawn a few starter stations with the three base shapes
@@ -1903,7 +2125,7 @@ function resumeFrom(reason) { G.paused = false; G.lastFrame = performance.now();
 function togglePause() {
   if (G.shopOpen) { closeShop(); return; }
   G.paused = !G.paused;
-  document.getElementById('pause-overlay').classList.toggle('hidden', !G.paused);
+  document.getElementById('pause-banner').classList.toggle('hidden', !G.paused);
   if (!G.paused) G.lastFrame = performance.now();
 }
 
@@ -1970,7 +2192,7 @@ function quitToMenu() {
   G.shopOpen = false;
   document.getElementById('hud').classList.add('hidden');
   document.getElementById('tray').classList.add('hidden');
-  document.getElementById('pause-overlay').classList.add('hidden');
+  document.getElementById('pause-banner').classList.add('hidden');
   document.getElementById('gameover-overlay').classList.add('hidden');
   document.getElementById('victory-overlay').classList.add('hidden');
   document.getElementById('shop-overlay').classList.add('hidden');
@@ -2146,7 +2368,18 @@ function bindMenu() {
   // keyboard
   window.addEventListener('keydown', (e) => {
     if (!G.running) return;
-    if (e.key === ' ' || e.key === 'Escape') {
+    if (e.key === 'Escape') {
+      // Escape priority: dismiss prompts first, then shop, then pause toggle
+      if (G.deletePrompt) {
+        e.preventDefault();
+        G.deletePrompt = null; G._deletePromptRect = null;
+        if (G.ctx) render();
+        return;
+      }
+      if (G.shopOpen) { e.preventDefault(); closeShop(); return; }
+      e.preventDefault();
+      togglePause();
+    } else if (e.key === ' ') {
       e.preventDefault();
       if (G.shopOpen) closeShop(); else togglePause();
     } else if (e.key === 'b' || e.key === 'B') {
