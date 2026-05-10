@@ -24,29 +24,40 @@ const CFG = {
   OVERCROWD_DAYS: 2.4,             // game over if any station stays full this long
   // shapes — basic three forever, exotic shapes appear as week progresses
   BASE_SHAPES: ['circle', 'triangle', 'square'],
-  EXOTIC_SHAPES: ['diamond', 'pentagon', 'star', 'cross', 'gem'],
+  EXOTIC_SHAPES: ['diamond', 'pentagon', 'star', 'cross', 'gem', 'hexagon', 'drop', 'crescent'],
   EXOTIC_SHAPE_WEEK: 2,            // first week an exotic shape can appear
-  EXOTIC_PASSENGER_RATE: 0.04,     // passengers wanting exotic shapes
   // trains
   TRAIN_SPEED: 80,                 // px/s base
   TRAIN_LOAD_TIME: 0.18,           // seconds per passenger boarding/alighting
   TRAIN_BASE_CAPACITY: 6,
   CARRIAGE_CAPACITY: 6,
-  // assets at start
-  STARTING_LINES: 3,
-  STARTING_TRAINS: 3,
-  STARTING_TUNNELS: 3,
+  // starting state
+  STARTING_CASH: 0,                // start with no cash, but a small pre-stock
+  STARTING_LINES: 3,               // 3 free line slots from the get-go
+  STARTING_TRAINS: 3,              // 3 free trains in inventory
+  STARTING_TUNNELS: 3,             // 3 free crossings
   STARTING_INTERCHANGES: 0,
+  // income per delivery
+  FARE_BASE: 1,                    // base coins per delivered passenger
+  FARE_EXOTIC: 1,                  // bonus for exotic shape passenger
+  // asset prices: price(n) = base + step * n_purchased
+  PRICES: {
+    line:        { base: 20, step: 10, max: 4 },   // 4 purchasable beyond starting 3 (cap 7 lines)
+    train:       { base: 10, step:  5, max: Infinity },
+    carriage:    { base: 12, step:  4, max: Infinity },
+    interchange: { base: 15, step:  5, max: Infinity },
+    crossing:    { base:  5, step:  2, max: Infinity },
+  },
+  REFUND_RATIO: 0.6,               // line removal refund
   // line snap distance
   HIT_RADIUS: 22,
   // station radius
   STATION_RADIUS: 13,
-  // map margin from edges
-  MAP_MARGIN: 60,
+  // map margin from edges (per-side, accounts for HUD top and tray bottom)
+  MAP_MARGIN: { top: 80, right: 50, bottom: 90, left: 50 },
   // station shape weights — common shapes are far more frequent
   COMMON_WEIGHT: 9,
-  EXOTIC_STATION_WEIGHT: 1,
-  EXOTIC_FIRST_WEEK: 1,
+  EXOTIC_STATION_WEIGHT: 2,
 };
 
 // transit-line palette (names match css custom props order)
@@ -108,10 +119,14 @@ const CITIES = [
 ];
 
 const MODES = {
-  normal:   { canEdit: true,  endless: false, weeklyUpgrades: true,  earnUpgrades: false, creative: false },
-  extreme:  { canEdit: false, endless: false, weeklyUpgrades: true,  earnUpgrades: false, creative: false },
-  endless:  { canEdit: true,  endless: true,  weeklyUpgrades: false, earnUpgrades: true,  creative: false },
-  creative: { canEdit: true,  endless: true,  weeklyUpgrades: false, earnUpgrades: false, creative: true  },
+  // target: deliveries needed to "complete" the city. After hitting target,
+  //   game offers victory screen + continue option.
+  // difficultyRamp: how aggressively passenger spawn rate ramps with score
+  //   (higher = harder progression).
+  normal:   { canEdit: true,  endless: false, creative: false, fareMult: 1.0,  spawnMult: 1.0,  target: 500, difficultyRamp: 1.0 },
+  extreme:  { canEdit: false, endless: false, creative: false, fareMult: 1.25, spawnMult: 1.1,  target: 750, difficultyRamp: 1.4 },
+  endless:  { canEdit: true,  endless: true,  creative: false, fareMult: 1.0,  spawnMult: 0.85, target: 0,   difficultyRamp: 0.8 },
+  creative: { canEdit: true,  endless: true,  creative: true,  fareMult: 1.0,  spawnMult: 1.0,  target: 0,   difficultyRamp: 0.0 },
 };
 
 /* -------------------------------------------------------------
@@ -141,9 +156,13 @@ const G = {
   trains: [],           // {id, lineId, pos, dir, speed, capacity, passengers:[shape], state, stateTimer, atIdx}
   passengers: [],       // not separate; passengers live on stations
 
-  // assets pool
+  // assets pool — what the player currently OWNS (not yet placed/used)
   assets: { tunnels: 0, interchanges: 0, carriages: 0, trainsAvailable: 0, linesAvailable: 0 },
   usedLines: new Set(), // slots in use
+
+  // economy
+  cash: 0,
+  purchased: { line: 0, train: 0, carriage: 0, interchange: 0, crossing: 0 },
 
   // input
   drag: null,
@@ -151,12 +170,13 @@ const G = {
 
   // stats / score
   score: 0,             // delivered passengers
+  earnings: 0,          // total cash earned (lifetime)
   weekIndex: 0,
   daysSinceWeek: 0,
   daysSinceStation: 0,
 
-  // weekly upgrade pending
-  pendingUpgrade: false,
+  // shop overlay
+  shopOpen: false,
 };
 
 /* persistent storage */
@@ -227,8 +247,10 @@ function showToast(msg, ms = 1700) {
 
 function cityRiversCanvas() {
   if (!G.city) return [];
-  const m = CFG.MAP_MARGIN, w = G.width - 2*m, h = G.height - 2*m;
-  return G.city.rivers.map(line => line.map(([nx, ny]) => ({ x: m + nx*w, y: m + ny*h })));
+  const M = CFG.MAP_MARGIN;
+  const w = G.width  - M.left - M.right;
+  const h = G.height - M.top  - M.bottom;
+  return G.city.rivers.map(line => line.map(([nx, ny]) => ({ x: M.left + nx*w, y: M.top + ny*h })));
 }
 
 // segment-segment intersection (proper, not endpoint-touching)
@@ -284,43 +306,100 @@ function pickPassengerShape(station) {
     const bases = CFG.BASE_SHAPES.filter(s => s !== station.shape);
     return choice(bases);
   }
-  return choice(pool);
+  // Bias picks toward rarer shape destinations (they're typically further away
+  // and require multi-line transit, making the game more interesting). Each
+  // shape gets weight = 1/count, so a unique exotic is much more likely to be
+  // picked than a common circle.
+  const counts = {};
+  for (const s of G.stations) counts[s.shape] = (counts[s.shape] || 0) + 1;
+  const weights = {};
+  for (const sh of pool) weights[sh] = 1 / Math.max(1, counts[sh] || 1);
+  return weightedPick(weights);
 }
 
-function spawnStation() {
-  if (G.stations.length >= 50) return; // hard ceiling
-  const m = CFG.MAP_MARGIN + 20;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const x = rand(m, G.width - m);
-    const y = rand(m, G.height - m);
-    // not on water (river)
-    let onWater = false;
-    for (const river of cityRiversCanvas()) {
-      for (let i = 0; i < river.length - 1; i++) {
-        const proj = projectOnSegment({x,y}, river[i], river[i+1]);
-        if (dist(proj.x, proj.y, x, y) < 22) { onWater = true; break; }
-      }
-      if (onWater) break;
-    }
-    if (onWater) continue;
-    // not too close to existing stations
-    let tooClose = false;
-    for (const s of G.stations) {
-      if (dist(x, y, s.x, s.y) < 70) { tooClose = true; break; }
-    }
-    if (tooClose) continue;
+/* Convert normalized [0..1] map coords to canvas pixels using current dimensions. */
+function mapToPx(nx, ny) {
+  const M = CFG.MAP_MARGIN;
+  const w = G.width  - M.left - M.right;
+  const h = G.height - M.top  - M.bottom;
+  return { x: M.left + nx * w, y: M.top + ny * h };
+}
+function pxToMap(x, y) {
+  const M = CFG.MAP_MARGIN;
+  const w = Math.max(1, G.width  - M.left - M.right);
+  const h = Math.max(1, G.height - M.top  - M.bottom);
+  return { nx: (x - M.left) / w, ny: (y - M.top) / h };
+}
 
-    const station = {
-      id: uid(),
-      x, y,
-      shape: pickStationShape(),
-      passengers: [],
-      overcrowdTime: 0,
-      capacityBonus: 0,    // interchanges
-      loadSpeedBonus: 0,
-    };
-    G.stations.push(station);
-    return station;
+/* Recompute every station's pixel coords from its stored normalized coords.
+   Called whenever the canvas resizes and once per frame (cheap). */
+function relayoutStations() {
+  for (const s of G.stations) {
+    if (typeof s.nx !== 'number') {
+      // backfill normalized coords for stations created before the refactor
+      const n = pxToMap(s.x, s.y);
+      s.nx = n.nx; s.ny = n.ny;
+    }
+    const p = mapToPx(s.nx, s.ny);
+    s.x = p.x; s.y = p.y;
+  }
+}
+
+function spawnStation(opts) {
+  if (G.stations.length >= 50) return; // hard ceiling
+  const M = CFG.MAP_MARGIN;
+  const pad = 20;
+  // Sanity guard: if dimensions are not yet set, refuse to spawn (caller may
+  // retry once the viewport is known). Prevents NaN/garbage station coords.
+  if (!G.width || !G.height || G.width < 50 || G.height < 50) return null;
+
+  // First pass: full constraints (no water, min 70px between stations)
+  // Fallback passes progressively relax: shorter min-distance, then allow
+  // closer-to-river spawns. Always succeed if the canvas is at all roomy.
+  const passes = (opts && opts.relaxed)
+    ? [{ minDist: 35, riverPad: 10 }]
+    : [
+        { minDist: 70, riverPad: 22 },
+        { minDist: 50, riverPad: 18 },
+        { minDist: 35, riverPad: 14 },
+      ];
+
+  for (const pass of passes) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const x = rand(M.left + pad, G.width  - M.right  - pad);
+      const y = rand(M.top  + pad, G.height - M.bottom - pad);
+      // not on water (river)
+      let onWater = false;
+      for (const river of cityRiversCanvas()) {
+        for (let i = 0; i < river.length - 1; i++) {
+          const proj = projectOnSegment({x,y}, river[i], river[i+1]);
+          if (dist(proj.x, proj.y, x, y) < pass.riverPad) { onWater = true; break; }
+        }
+        if (onWater) break;
+      }
+      if (onWater) continue;
+      // not too close to existing stations
+      let tooClose = false;
+      for (const s of G.stations) {
+        if (dist(x, y, s.x, s.y) < pass.minDist) { tooClose = true; break; }
+      }
+      if (tooClose) continue;
+
+      const n = pxToMap(x, y);
+      const station = {
+        id: uid(),
+        x, y,
+        nx: n.nx, ny: n.ny,
+        shape: pickStationShape(),
+        passengers: [],
+        overcrowdTime: 0,
+        capacityBonus: 0,    // interchanges
+        loadSpeedBonus: 0,
+      };
+      G.stations.push(station);
+      G._netDirty = true;
+      return station;
+    }
   }
   return null;
 }
@@ -363,6 +442,7 @@ function createLine(stationA, stationB) {
     crossings: segmentCrossesWater({x: stationA.x, y: stationA.y}, {x: stationB.x, y: stationB.y}) ? 1 : 0,
   };
   G.lines.push(line);
+  G._netDirty = true;
   // give the line a starting train if available
   if (G.assets.trainsAvailable > 0) {
     addTrain(line.id);
@@ -402,6 +482,7 @@ function extendLine(line, fromStationId, toStation) {
   }
   if (attachEnd === 'start') line.stations.unshift(toStation.id);
   else line.stations.push(toStation.id);
+  G._netDirty = true;
 
   // ensure line has at least one train
   if (!G.trains.some(t => t.lineId === line.id) && G.assets.trainsAvailable > 0) {
@@ -425,6 +506,66 @@ function deleteLine(line) {
   }
   G.assets.tunnels += line.crossings;
   G.lines.splice(G.lines.indexOf(line), 1);
+  G._netDirty = true;
+}
+
+/* Shrink a line by removing the endpoint segment on the given side.
+   `end` is 'start' or 'end'. If shrinking would leave the line with < 2 stations,
+   the line is fully deleted (recovers all assets). */
+function shrinkLine(line, end) {
+  if (!G.mode.canEdit) { showToast('extreme: cannot edit'); return false; }
+  const stations = line.stations;
+  if (stations.length <= 2) {
+    // single segment: drop the line entirely
+    deleteLine(line);
+    showToast('line removed');
+    return true;
+  }
+  // figure out the two endpoints of the segment we're removing
+  let removedFromId, neighborId;
+  if (end === 'start') {
+    removedFromId = stations[0];
+    neighborId = stations[1];
+  } else {
+    removedFromId = stations[stations.length - 1];
+    neighborId = stations[stations.length - 2];
+  }
+  const removedStation = G.stations.find(s => s.id === removedFromId);
+  const neighborStation = G.stations.find(s => s.id === neighborId);
+
+  // refund a crossing if that segment was over water
+  if (removedStation && neighborStation &&
+      segmentCrossesWater({x: removedStation.x, y: removedStation.y},
+                          {x: neighborStation.x, y: neighborStation.y})) {
+    G.assets.tunnels++;
+    line.crossings = Math.max(0, line.crossings - 1);
+  }
+
+  if (line.loop) {
+    // closing-edge removal opens the loop
+    line.loop = false;
+  }
+  if (end === 'start') stations.shift();
+  else stations.pop();
+
+  // re-snap any train sitting at or beyond the removed end so it doesn't go off-array
+  for (const train of G.trains) {
+    if (train.lineId !== line.id) continue;
+    if (train.atIdx >= stations.length) {
+      train.atIdx = stations.length - 1;
+      train.pos = 0;
+      train.dir = -1;
+    }
+    if (train.atIdx < 0) {
+      train.atIdx = 0;
+      train.pos = 0;
+      train.dir = 1;
+    }
+  }
+
+  G._netDirty = true;
+  showToast('segment removed');
+  return true;
 }
 
 function addTrain(lineId) {
@@ -456,13 +597,97 @@ function lineStationPoints(line) {
 }
 
 /* -------------------------------------------------------------
- * 7. SIMULATION STEP
+ * 6b. ECONOMY — fares, prices, purchases
  * ------------------------------------------------------------- */
+
+function priceOf(kind) {
+  const p = CFG.PRICES[kind];
+  if (!p) return Infinity;
+  const n = G.purchased[kind] || 0;
+  if (n >= p.max) return Infinity;
+  return p.base + p.step * n;
+}
+
+function canBuy(kind) {
+  if (G.mode.creative) return true;
+  return G.cash >= priceOf(kind);
+}
+
+function buy(kind) {
+  if (G.mode.creative) {
+    // free, but still increment counters and grant
+    grantAsset(kind);
+    return true;
+  }
+  const cost = priceOf(kind);
+  if (cost === Infinity) { showToast('not available'); return false; }
+  if (G.cash < cost) { showToast('not enough coins'); return false; }
+  G.cash -= cost;
+  G.purchased[kind] = (G.purchased[kind] || 0) + 1;
+  grantAsset(kind);
+  return true;
+}
+
+function grantAsset(kind) {
+  switch (kind) {
+    case 'line':        G.assets.linesAvailable++;   showToast('+1 line slot'); break;
+    case 'train':       G.assets.trainsAvailable++;  autoAttachTrain(); break;
+    case 'carriage':    G.assets.carriages++;        autoAttachCarriage(); break;
+    case 'interchange': G.assets.interchanges++;     autoApplyInterchange(); break;
+    case 'crossing':    G.assets.tunnels++;          showToast('+1 crossing'); break;
+  }
+  refreshShop();
+  refreshTray();
+}
+
+function autoAttachTrain() {
+  // find the line with the most waiting passengers and one or zero trains
+  const candidates = G.lines.map(line => {
+    const stations = lineStationPoints(line);
+    const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
+    const trains = G.trains.filter(t => t.lineId === line.id).length;
+    return { line, waiting, trains };
+  }).sort((a, b) => (b.waiting - b.trains * 4) - (a.waiting - a.trains * 4));
+  if (candidates[0]) {
+    addTrain(candidates[0].line.id);
+    G.assets.trainsAvailable--;
+    showToast('train assigned');
+  } else {
+    showToast('+1 train (build a line first)');
+  }
+}
+
+function payForDelivery(shape) {
+  G.score++;
+  let coins = CFG.FARE_BASE;
+  if (CFG.EXOTIC_SHAPES.includes(shape)) coins += CFG.FARE_EXOTIC;
+  coins = Math.round(coins * G.mode.fareMult);
+  if (G.mode.creative) coins = 0; // creative: no money tracking needed
+  G.cash += coins;
+  G.earnings += coins;
+  // milestone toasts on the way to the target
+  if (!G.mode.creative) {
+    const milestones = [25, 50, 100, 250, 500, 1000, 2000];
+    if (milestones.includes(G.score)) {
+      showToast(`${G.score} delivered`, 1500);
+    }
+  }
+  // Reaching the mode's target triggers the victory screen (once per game).
+  if (G.mode.target > 0 && G.score === G.mode.target && !G.victoryShown) {
+    G.victoryShown = true;
+    showVictory();
+  }
+}
+
+
 
 function simStep(dt) {
   // dt in real seconds; in-game time scales by 1/SECONDS_PER_DAY days/sec
   const dayDt = dt / CFG.SECONDS_PER_DAY;
   G.time += dt;
+
+  // ensure reachability cache is current
+  if (G._netDirty) { recomputeReachability(); G._netDirty = false; }
 
   // station spawning
   G.daysSinceStation += dayDt;
@@ -472,8 +697,11 @@ function simStep(dt) {
   }
 
   // passenger spawning — proportional to number of stations
-  // chance per station per day = 1 / PASSENGER_SPAWN_DAYS, scaled by week
-  const ridershipMult = 1 + G.weekIndex * 0.06;
+  // chance per station per day = 1 / PASSENGER_SPAWN_DAYS, scaled by week and score
+  const weekRamp = 1 + G.weekIndex * 0.06;
+  // score-based ramp: each 100 deliveries adds difficultyRamp * 0.10 to the multiplier
+  const scoreRamp = 1 + (G.score / 100) * 0.10 * G.mode.difficultyRamp;
+  const ridershipMult = weekRamp * scoreRamp * G.mode.spawnMult;
   for (const s of G.stations) {
     const chance = (dayDt / CFG.PASSENGER_SPAWN_DAYS) * ridershipMult;
     if (Math.random() < chance) spawnPassenger(s);
@@ -496,25 +724,12 @@ function simStep(dt) {
   // train movement & passenger logic
   for (const train of G.trains) updateTrain(train, dt);
 
-  // weekly tick
+  // weekly tick — drives shape escalation and difficulty
   G.daysSinceWeek += dayDt;
   if (G.daysSinceWeek >= CFG.DAYS_PER_WEEK) {
     G.daysSinceWeek = 0;
     G.weekIndex++;
-    if (G.mode.weeklyUpgrades) {
-      G.pendingUpgrade = true;
-      pauseFor('upgrade');
-      showUpgradeOverlay();
-    }
-  }
-
-  // endless: earn upgrades by ridership (every 30 deliveries)
-  if (G.mode.earnUpgrades) {
-    const tier = Math.floor(G.score / 30);
-    if (tier > G._lastEarnTier) {
-      G._lastEarnTier = tier;
-      if (tier > 0) grantRandomUpgrade(false);
-    }
+    showToast(`week ${G.weekIndex}`);
   }
 }
 
@@ -523,6 +738,9 @@ function updateTrain(train, dt) {
   if (!line) return;
   const pts = lineStationPoints(line);
   if (pts.length < 2) return;
+  // Defensive: clamp atIdx in case the line was edited while the train ran
+  if (train.atIdx >= pts.length) { train.atIdx = pts.length - 1; train.dir = -1; train.pos = 0; }
+  if (train.atIdx < 0)            { train.atIdx = 0;               train.dir =  1; train.pos = 0; }
 
   if (train.state === 'loading') {
     train.stateTimer -= dt;
@@ -531,6 +749,7 @@ function updateTrain(train, dt) {
   }
 
   const station = pts[train.atIdx];
+  if (!station) return;
   // determine next index
   let nextIdx;
   if (line.loop) {
@@ -541,6 +760,7 @@ function updateTrain(train, dt) {
     else if (nextIdx < 0)      { train.dir =  1; nextIdx = train.atIdx + train.dir; }
   }
   const next = pts[nextIdx];
+  if (!next) return;
   const segLen = dist(station.x, station.y, next.x, next.y);
   // pos goes from 0 (at station) to 1 (at next)
   train.pos += (train.speed * dt) / Math.max(1, segLen);
@@ -554,29 +774,79 @@ function updateTrain(train, dt) {
 }
 
 function handleTrainAtStation(train, line, pts) {
+  if (G._netDirty || !G._lineReachable) recomputeReachability();
   const station = pts[train.atIdx];
   const cap = train.capacity + train.carriages * CFG.CARRIAGE_CAPACITY;
-  // future stations on this train's path (used to decide if a passenger should board)
-  const reachableShapes = new Set(pts.map(s => s.shape));
 
-  // alight: any train passenger whose desired shape == station.shape
+  const stationLines = G._stationLines.get(station.id) || [];
+  const otherLinesHere = stationLines.filter(lid => lid !== line.id);
+
+  // hop distance from the CURRENT line to each shape (memoized in G._lineHopsToShape)
+  const myHops = G._lineHopsToShape.get(line.id) || new Map();
+
+  // ---- ALIGHT / TRANSFER ----
+  // Rule: a passenger leaves the train if
+  //   (a) their target shape is this station's shape (delivered), or
+  //   (b) some other line at this station has a strictly shorter hop-distance
+  //       to the target shape than the current line.
+  // Tie: they stay aboard (avoids ping-pong between equally-short alternatives).
   const stayed = [];
   let alighted = 0;
+  let transferred = 0;
+  const transferredShapes = []; // queued onto station AFTER boarding pass to avoid re-board same train
+
   for (const shape of train.passengers) {
     if (shape === station.shape) {
-      G.score++;
+      payForDelivery(shape);
       alighted++;
+      continue;
+    }
+    // current train's distance to destination, measured in *line-hops*.
+    // 0 = shape directly on current line; we keep them aboard (they ride to it).
+    const myDist = myHops.has(shape) ? myHops.get(shape) : Infinity;
+
+    // is there a strictly better line right here?
+    let bestOtherDist = Infinity;
+    for (const lid of otherLinesHere) {
+      const m = G._lineHopsToShape.get(lid);
+      const d = (m && m.has(shape)) ? m.get(shape) : Infinity;
+      if (d < bestOtherDist) bestOtherDist = d;
+    }
+
+    if (bestOtherDist < myDist) {
+      // disembark and queue for re-board (after this train's boarding pass)
+      transferredShapes.push(shape);
+      transferred++;
     } else {
       stayed.push(shape);
     }
   }
   train.passengers = stayed;
 
-  // board: those whose shape is reachable on this line
+  // ---- BOARD ----
+  // A passenger boards if the current line can reach their target,
+  // i.e. myHops has the shape with finite distance. Skip station's own shape.
+  // If multiple lines stop here, the passenger should pick the line with
+  // the smallest hop-distance to their target — but the train that arrived
+  // is the one boarding now; passengers whose best option is a different
+  // line stay on the platform until that line's train shows up.
   const remaining = [];
   let boarded = 0;
   for (const shape of station.passengers) {
-    if (train.passengers.length < cap && reachableShapes.has(shape)) {
+    if (shape === station.shape) { remaining.push(shape); continue; }
+    const myDist = myHops.has(shape) ? myHops.get(shape) : Infinity;
+    if (myDist === Infinity) { remaining.push(shape); continue; }
+
+    // is another line here strictly better? if so, wait for it.
+    let bestOtherDist = Infinity;
+    for (const lid of otherLinesHere) {
+      const m = G._lineHopsToShape.get(lid);
+      const d = (m && m.has(shape)) ? m.get(shape) : Infinity;
+      if (d < bestOtherDist) bestOtherDist = d;
+    }
+    if (bestOtherDist < myDist) { remaining.push(shape); continue; }
+
+    if (train.passengers.length < cap) {
       train.passengers.push(shape);
       boarded++;
     } else {
@@ -585,11 +855,98 @@ function handleTrainAtStation(train, line, pts) {
   }
   station.passengers = remaining;
 
-  const exchanged = alighted + boarded;
+  // now add the just-transferred passengers — they'll wait at this station for
+  // their better line. They won't be picked up by THIS train this cycle because
+  // boarding already happened above.
+  for (const sh of transferredShapes) station.passengers.push(sh);
+
+  const exchanged = alighted + boarded + transferred;
   if (exchanged > 0) {
     train.state = 'loading';
     train.stateTimer = CFG.TRAIN_LOAD_TIME * exchanged * (1 - station.loadSpeedBonus * 0.4);
   }
+}
+
+/* -------------------------------------------------------------
+ * 7b. NETWORK REACHABILITY
+ * For each line, compute the set of shapes reachable via this line
+ * including transitive transfers at shared stations. Passengers
+ * board if their target shape is in that set.
+ * ------------------------------------------------------------- */
+
+function recomputeReachability() {
+  // map: stationId -> [lineIds]
+  const stationLines = new Map();
+  for (const line of G.lines) {
+    for (const sid of line.stations) {
+      if (!stationLines.has(sid)) stationLines.set(sid, []);
+      stationLines.get(sid).push(line.id);
+    }
+  }
+  // direct shapes per line (just the shapes of stations on that line)
+  const directShapes = new Map();
+  for (const line of G.lines) {
+    const set = new Set();
+    for (const sid of line.stations) {
+      const s = G.stations.find(st => st.id === sid);
+      if (s) set.add(s.shape);
+    }
+    directShapes.set(line.id, set);
+  }
+  // line adjacency: lines are connected if they share a station
+  const lineAdj = new Map();
+  for (const line of G.lines) lineAdj.set(line.id, new Set());
+  for (const [sid, lids] of stationLines) {
+    for (let i = 0; i < lids.length; i++) {
+      for (let j = i + 1; j < lids.length; j++) {
+        lineAdj.get(lids[i]).add(lids[j]);
+        lineAdj.get(lids[j]).add(lids[i]);
+      }
+    }
+  }
+  // For each line, BFS over the line-graph computing hop-distance to every line.
+  // A line has hop-distance 0 to itself, 1 to lines directly sharing a station, etc.
+  // hopsToShape[lineId][shape] = minimum number of line-hops needed (0 = on this line).
+  const hopsToShape = new Map();
+  const reachable = new Map();
+  for (const startLine of G.lines) {
+    const dist = new Map(); // lineId -> hops
+    dist.set(startLine.id, 0);
+    const queue = [startLine.id];
+    while (queue.length) {
+      const lid = queue.shift();
+      const d = dist.get(lid);
+      for (const nb of lineAdj.get(lid) || []) {
+        if (!dist.has(nb)) {
+          dist.set(nb, d + 1);
+          queue.push(nb);
+        }
+      }
+    }
+    // for each shape, the min hops is the smallest dist over any line that has the shape directly
+    const perShape = new Map();
+    for (const [lid, d] of dist) {
+      for (const sh of directShapes.get(lid) || []) {
+        if (!perShape.has(sh) || perShape.get(sh) > d) perShape.set(sh, d);
+      }
+    }
+    hopsToShape.set(startLine.id, perShape);
+    reachable.set(startLine.id, new Set(perShape.keys()));
+  }
+
+  G._stationLines = stationLines;
+  G._lineDirectShapes = directShapes;
+  G._lineReachable = reachable;
+  G._lineHopsToShape = hopsToShape;
+}
+
+// helper: hops from line `lineId` to nearest station with `shape`.
+// returns Infinity if unreachable, 0 if shape is directly on the line.
+function hopsFromLineToShape(lineId, shape) {
+  const map = G._lineHopsToShape && G._lineHopsToShape.get(lineId);
+  if (!map) return Infinity;
+  const v = map.get(shape);
+  return v === undefined ? Infinity : v;
 }
 
 /* -------------------------------------------------------------
@@ -598,25 +955,40 @@ function handleTrainAtStation(train, line, pts) {
 
 function resizeCanvas() {
   const c = G.canvas;
+  if (!c) return;
   G.dpr = window.devicePixelRatio || 1;
-  G.width = window.innerWidth;
-  G.height = window.innerHeight;
-  c.width = G.width * G.dpr;
+  // Source of truth: the viewport. Never read getBoundingClientRect on the
+  // canvas itself — that would round-trip our previous inline size.
+  G.width  = Math.max(1, Math.floor(window.innerWidth));
+  G.height = Math.max(1, Math.floor(window.innerHeight));
+  // Backing-store size (device pixels for crisp HiDPI rendering)
+  c.width  = G.width  * G.dpr;
   c.height = G.height * G.dpr;
-  c.style.width = G.width + 'px';
+  // CSS display size (CSS pixels). MUST be set, otherwise the browser shows
+  // the canvas at its backing-store size in CSS pixels and HiDPI canvases
+  // overflow the viewport.
+  c.style.width  = G.width  + 'px';
   c.style.height = G.height + 'px';
   G.ctx.setTransform(G.dpr, 0, 0, G.dpr, 0, 0);
 }
 
 function render() {
   const ctx = G.ctx;
+  // keep stations in sync with current viewport size (they live in normalized space)
+  relayoutStations();
   ctx.clearRect(0, 0, G.width, G.height);
 
   drawWater(ctx);
-  if (G.drag && G.drag.kind === 'newline') drawDragPreview(ctx);
   drawLines(ctx);
   drawTrains(ctx);
   drawStations(ctx);
+  drawLineGrips(ctx);
+  drawShrinkHint(ctx);
+  // Drag preview must render LAST so it's never hidden behind stations or other
+  // chrome. Otherwise the first ~13px of the dashed line (covered by the start
+  // station) is invisible, which on short drags makes the whole preview look
+  // missing.
+  if (G.drag && G.drag.kind === 'newline') drawDragPreview(ctx);
 
   if (G.mode.creative) drawCreativeHint(ctx);
 }
@@ -672,14 +1044,120 @@ function drawDragPreview(ctx) {
   if (!d.fromStation && !d.fromLineEnd) return;
   const a = d.fromStation || G.stations.find(s => s.id === d.fromLineEnd.stationId);
   if (!a) return;
+  const tx = d.cursorX, ty = d.cursorY;
+  // bail if the drag hasn't moved at all yet (zero-length line is invisible)
+  const dx = tx - a.x, dy = ty - a.y;
+  if (dx*dx + dy*dy < 4) return;
+
   ctx.save();
-  ctx.strokeStyle = d.color || getCss('--ink');
-  ctx.lineWidth = 4;
-  ctx.setLineDash([8, 6]);
   ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  // 1) wide paper-coloured halo so the dashed line stands out against any
+  //    background (water, existing lines, etc.)
+  ctx.strokeStyle = getCss('--paper');
+  ctx.lineWidth = 10;
+  ctx.setLineDash([]);
   ctx.beginPath();
   ctx.moveTo(a.x, a.y);
-  ctx.lineTo(d.cursorX, d.cursorY);
+  ctx.lineTo(tx, ty);
+  ctx.stroke();
+
+  // 2) the dashed line itself in the line colour
+  ctx.strokeStyle = d.color || getCss('--ink');
+  ctx.lineWidth = 5;
+  ctx.setLineDash([10, 7]);
+  ctx.lineDashOffset = -((performance.now() / 60) % 17); // slight march for liveliness
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(tx, ty);
+  ctx.stroke();
+
+  // 3) a small endpoint marker at the cursor, snapped to a station if hovered
+  const hover = stationAt(tx, ty);
+  const cx = hover ? hover.x : tx;
+  const cy = hover ? hover.y : ty;
+  ctx.setLineDash([]);
+  ctx.fillStyle = d.color || getCss('--ink');
+  ctx.strokeStyle = getCss('--paper');
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, hover ? 7 : 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+/* Grip handles at line endpoints — drawn as a wedge/arrowhead extending from
+   the endpoint station along the line's outward direction. Visually distinct
+   from passenger dots. Hidden on extreme mode and on looped lines. */
+function drawLineGrips(ctx) {
+  if (!G.mode.canEdit) return;
+  const draggingEnd = G.drag && G.drag.fromLineEnd ? G.drag.fromLineEnd : null;
+
+  for (const line of G.lines) {
+    if (line.loop) continue;
+    const pts = lineStationPoints(line);
+    if (pts.length < 2) continue;
+    const ends = [
+      { p: pts[0],              end: 'start', neighbor: pts[1] },
+      { p: pts[pts.length - 1], end: 'end',   neighbor: pts[pts.length - 2] },
+    ];
+    for (const e of ends) {
+      if (draggingEnd && draggingEnd.line === line && draggingEnd.end === e.end) continue;
+      // outward direction (away from neighbor, past the endpoint station)
+      const dx = e.p.x - e.neighbor.x, dy = e.p.y - e.neighbor.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len, uy = dy / len;
+      // perpendicular vector
+      const px = -uy, py = ux;
+
+      // start the wedge at the station edge, extend outward by ~14px
+      const baseDist = CFG.STATION_RADIUS + 4;
+      const tipDist  = CFG.STATION_RADIUS + 18;
+      const halfWidth = 7;
+
+      const bx = e.p.x + ux * baseDist;
+      const by = e.p.y + uy * baseDist;
+      const tx = e.p.x + ux * tipDist;
+      const ty = e.p.y + uy * tipDist;
+
+      // a triangular pull-tab: base at the station side, tip pointing outward
+      ctx.save();
+      ctx.fillStyle = line.color;
+      ctx.strokeStyle = getCss('--paper');
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(bx + px * halfWidth, by + py * halfWidth);
+      ctx.lineTo(bx - px * halfWidth, by - py * halfWidth);
+      ctx.lineTo(tx, ty);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+/* When the user is dragging an endpoint and is hovering on the adjacent station
+   on that same line, show a clear "release to shrink" hint. */
+function drawShrinkHint(ctx) {
+  if (!G.drag || !G.drag.fromLineEnd) return;
+  const ep = G.drag.fromLineEnd;
+  const line = ep.line;
+  const stations = line.stations;
+  if (stations.length < 2) return;
+  const adjacentId = ep.end === 'start' ? stations[1] : stations[stations.length - 2];
+  const target = stationAt(G.drag.cursorX, G.drag.cursorY);
+  if (!target || target.id !== adjacentId) return;
+  ctx.save();
+  ctx.strokeStyle = getCss('--danger');
+  ctx.lineWidth = 2.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, CFG.STATION_RADIUS + 14, 0, Math.PI * 2);
   ctx.stroke();
   ctx.restore();
 }
@@ -761,6 +1239,34 @@ function drawShape(ctx, x, y, shape, r, stroke, fill, ringed) {
       ctx.lineTo(x - r * 1.1, y - r * 0.2);
       ctx.closePath();
       break;
+    case 'hexagon':
+      for (let i = 0; i < 6; i++) {
+        const a = i * (Math.PI / 3);
+        const px = x + Math.cos(a) * r * 1.1;
+        const py = y + Math.sin(a) * r * 1.1;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      break;
+    case 'drop': {
+      // teardrop: pointy at top, round at bottom
+      ctx.moveTo(x, y - r * 1.2);
+      ctx.bezierCurveTo(x + r * 1.1, y - r * 0.2, x + r * 1.0, y + r * 0.9, x, y + r);
+      ctx.bezierCurveTo(x - r * 1.0, y + r * 0.9, x - r * 1.1, y - r * 0.2, x, y - r * 1.2);
+      ctx.closePath();
+      break;
+    }
+    case 'crescent': {
+      // moon crescent: outer arc minus inner arc
+      const ro = r * 1.05;
+      const ri = r * 0.85;
+      // outer arc from top to bottom (right side)
+      ctx.arc(x, y, ro, -Math.PI / 2, Math.PI / 2, false);
+      // inner arc back from bottom to top (cuts the moon)
+      ctx.arc(x + r * 0.32, y, ri, Math.PI / 2, -Math.PI / 2, true);
+      ctx.closePath();
+      break;
+    }
     default:
       ctx.arc(x, y, r, 0, Math.PI*2);
   }
@@ -807,11 +1313,15 @@ function drawTrains(ctx) {
     if (!line) continue;
     const pts = lineStationPoints(line);
     if (pts.length < 2) continue;
+    // clamp in case the line was edited mid-frame
+    if (train.atIdx >= pts.length) train.atIdx = pts.length - 1;
+    if (train.atIdx < 0) train.atIdx = 0;
     let nextIdx;
     if (line.loop) nextIdx = (train.atIdx + train.dir + pts.length) % pts.length;
     else nextIdx = clamp(train.atIdx + train.dir, 0, pts.length - 1);
 
     const a = pts[train.atIdx], b = pts[nextIdx];
+    if (!a || !b) continue;
     const x = a.x + (b.x - a.x) * train.pos;
     const y = a.y + (b.y - a.y) * train.pos;
     const angle = Math.atan2(b.y - a.y, b.x - a.x);
@@ -887,12 +1397,29 @@ function stationAt(x, y) {
 }
 
 function lineEndpointAt(x, y) {
+  // Match a comfortable area centered on the wedge grip. Lets a user start a
+  // new line from the endpoint station body itself (the body is NOT part of
+  // the grip hit-area).
   for (const line of G.lines) {
+    if (line.loop) continue;
     const pts = lineStationPoints(line);
-    if (pts.length === 0) continue;
-    const first = pts[0], last = pts[pts.length - 1];
-    if (dist(first.x, first.y, x, y) <= CFG.HIT_RADIUS) return { line, stationId: first.id, end: 'start' };
-    if (dist(last.x,  last.y,  x, y) <= CFG.HIT_RADIUS) return { line, stationId: last.id,  end: 'end' };
+    if (pts.length < 2) continue;
+    const ends = [
+      { p: pts[0],              end: 'start', stationId: line.stations[0],                          neighbor: pts[1] },
+      { p: pts[pts.length - 1], end: 'end',   stationId: line.stations[line.stations.length - 1],   neighbor: pts[pts.length - 2] },
+    ];
+    for (const e of ends) {
+      const dx = e.p.x - e.neighbor.x, dy = e.p.y - e.neighbor.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len, uy = dy / len;
+      // grip center: midway between base and tip
+      const centerDist = CFG.STATION_RADIUS + 11;
+      const gx = e.p.x + ux * centerDist;
+      const gy = e.p.y + uy * centerDist;
+      if (dist(gx, gy, x, y) <= 16) {
+        return { line, stationId: e.stationId, end: e.end };
+      }
+    }
   }
   return null;
 }
@@ -915,32 +1442,36 @@ function setupInput() {
   c.addEventListener('pointerup', onPointerUp);
   c.addEventListener('pointercancel', onPointerUp);
   c.addEventListener('dblclick', onDoubleClick);
+  c.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  // long-press for delete
-  let longPressTimer = null, longPressPos = null;
-  c.addEventListener('pointerdown', (e) => {
-    longPressPos = pointerPos(e);
-    clearTimeout(longPressTimer);
-    longPressTimer = setTimeout(() => {
-      if (!G.drag) {
-        const line = lineSegmentAt(longPressPos.x, longPressPos.y);
-        if (line) {
-          deleteLine(line);
-          showToast('line removed');
-        }
-      }
-    }, 600);
+  // Fallback: if a pointer is released somewhere outside the canvas (e.g. on
+  // an HTML element that swallowed the event despite setPointerCapture), make
+  // sure we still clear any in-progress drag and force a redraw — otherwise
+  // the dashed preview hangs around indefinitely.
+  window.addEventListener('pointerup', (e) => {
+    if (G.drag) onPointerUp(e);
   });
-  c.addEventListener('pointerup', () => clearTimeout(longPressTimer));
-  c.addEventListener('pointermove', () => {
-    // cancel long-press if user is drag-creating a line
-    if (G.drag) clearTimeout(longPressTimer);
+  window.addEventListener('pointercancel', (e) => {
+    if (G.drag) onPointerUp(e);
+  });
+  // Also clear on visibility change / blur — if the user tabs away mid-drag
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && G.drag) {
+      G.drag = null;
+      if (G.running && G.ctx) render();
+    }
   });
 }
 
 function onPointerDown(e) {
   if (!G.running || G.paused) return;
   const p = pointerPos(e);
+
+  // capture this pointer so move/up events keep firing on the canvas even if
+  // the user drags the cursor off the canvas onto the HUD or tray.
+  if (e.pointerId !== undefined) {
+    try { G.canvas.setPointerCapture(e.pointerId); } catch {}
+  }
 
   // try line endpoint first (for extending)
   const ep = lineEndpointAt(p.x, p.y);
@@ -974,22 +1505,52 @@ function onPointerMove(e) {
   if (G.drag) {
     G.drag.cursorX = p.x;
     G.drag.cursorY = p.y;
+    // Belt-and-suspenders: render immediately so the dashed preview
+    // updates without waiting for the next animation frame, even if RAF
+    // is throttled (e.g. background tab waking up, slow device).
+    if (G.running && G.ctx) render();
   }
   G.hover = stationAt(p.x, p.y);
 }
 
 function onPointerUp(e) {
+  if (e && e.pointerId !== undefined) {
+    try { G.canvas.releasePointerCapture(e.pointerId); } catch {}
+  }
   if (!G.drag) return;
-  const p = pointerPos(e);
-  const target = stationAt(p.x, p.y);
-  if (target) {
-    if (G.drag.fromStation && target.id !== G.drag.fromStation.id) {
+  try {
+    const p = pointerPos(e);
+    const target = stationAt(p.x, p.y);
+
+    if (G.drag.fromStation && target && target.id !== G.drag.fromStation.id) {
+      // creating a brand-new line from an empty station to another station
       createLine(G.drag.fromStation, target);
     } else if (G.drag.fromLineEnd) {
-      extendLine(G.drag.fromLineEnd.line, G.drag.fromLineEnd.stationId, target);
+      const ep = G.drag.fromLineEnd;
+      const line = ep.line;
+      if (target) {
+        // Decide: extend, close loop, or shrink.
+        const stations = line.stations;
+        const isStartEnd = ep.end === 'start';
+        const adjacentStationId = isStartEnd ? stations[1] : stations[stations.length - 2];
+        if (target.id === adjacentStationId && stations.length >= 2) {
+          shrinkLine(line, ep.end);
+        } else if (stations.includes(target.id)) {
+          extendLine(line, ep.stationId, target);
+        } else {
+          extendLine(line, ep.stationId, target);
+        }
+      }
+      // released in empty space → no-op (the line stays unchanged)
     }
+  } catch (err) {
+    console.error('pointerup handler error:', err);
+  } finally {
+    // ALWAYS clear the drag and force a re-render so the dashed preview
+    // disappears immediately, even if something above threw or RAF is slow.
+    G.drag = null;
+    if (G.running && G.ctx) render();
   }
-  G.drag = null;
 }
 
 function onDoubleClick(e) {
@@ -1005,98 +1566,88 @@ function onDoubleClick(e) {
   for (const s of G.stations) {
     if (dist(s.x, s.y, p.x, p.y) < 50) { showToast('too close'); return; }
   }
+  const n = pxToMap(p.x, p.y);
   G.stations.push({
-    id: uid(), x: p.x, y: p.y,
+    id: uid(), x: p.x, y: p.y, nx: n.nx, ny: n.ny,
     shape: pickStationShape(),
     passengers: [], overcrowdTime: 0, capacityBonus: 0, loadSpeedBonus: 0,
   });
+  G._netDirty = true;
 }
 
 /* -------------------------------------------------------------
- * 10. WEEKLY UPGRADE
+ * 10. SHOP — buy assets with delivered-passenger fares
+ * Open from HUD; pauses time while open.
  * ------------------------------------------------------------- */
 
-const UPGRADES = {
-  line:        { name: 'New Line', desc: 'unlock another line slot', icon: 'L' },
-  train:       { name: 'Train', desc: 'a new locomotive', icon: 'T' },
-  carriage:    { name: 'Carriage', desc: 'extend a train by 6 seats', icon: 'C' },
-  interchange: { name: 'Interchange', desc: '+capacity, faster loading', icon: 'I' },
-  tunnel:      { name: 'Tunnels (×2)', desc: 'cross water', icon: '~' },
+const SHOP_ITEMS = {
+  line:        { name: 'New Line', desc: 'unlock another colour line' },
+  train:       { name: 'Train', desc: 'one extra locomotive' },
+  carriage:    { name: 'Carriage', desc: '+6 seats on busiest train' },
+  interchange: { name: 'Interchange', desc: '+capacity at busiest station' },
+  crossing:    { name: 'Crossing', desc: 'bridge or tunnel for water' },
 };
 
-function rollUpgradeOptions() {
-  // always include train; randomize the second
-  const pool = ['line', 'carriage', 'interchange', 'tunnel'];
-  const second = choice(pool);
-  return ['train', second];
-}
+const SHOP_ORDER = ['line', 'train', 'carriage', 'interchange', 'crossing'];
 
-function showUpgradeOverlay() {
-  const overlay = document.getElementById('upgrade-overlay');
-  const optsEl = document.getElementById('upgrade-options');
-  const subEl = document.getElementById('upgrade-sub');
-  subEl.textContent = `week ${G.weekIndex} — choose an upgrade`;
-  optsEl.innerHTML = '';
-  const opts = rollUpgradeOptions();
-  for (const key of opts) {
-    const u = UPGRADES[key];
-    const btn = document.createElement('button');
-    btn.className = 'upgrade-option';
-    btn.innerHTML = `
-      <span class="upgrade-icon">
-        <svg viewBox="0 0 36 36" width="36" height="36">${upgradeIconSvg(key)}</svg>
-      </span>
-      <span class="upgrade-name">${u.name}</span>
-      <span class="upgrade-desc">${u.desc}</span>
-    `;
-    btn.addEventListener('click', () => {
-      applyUpgrade(key);
-      overlay.classList.add('hidden');
-      G.pendingUpgrade = false;
-      resumeFrom('upgrade');
-    });
-    optsEl.appendChild(btn);
-  }
-  overlay.classList.remove('hidden');
-}
-
-function upgradeIconSvg(key) {
+function shopIconSvg(key) {
   switch (key) {
-    case 'line':        return '<line x1="6" y1="18" x2="30" y2="18" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>';
+    case 'line':        return '<line x1="6" y1="18" x2="30" y2="18" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/>';
     case 'train':       return '<rect x="6" y="14" width="24" height="8" rx="2" fill="currentColor"/>';
     case 'carriage':    return '<rect x="4" y="14" width="13" height="8" rx="1.5" fill="currentColor"/><rect x="19" y="14" width="13" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/>';
     case 'interchange': return '<circle cx="18" cy="18" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/><circle cx="18" cy="18" r="3" fill="currentColor"/>';
-    case 'tunnel':      return '<path d="M4 22 Q18 6 32 22" fill="none" stroke="currentColor" stroke-width="2.5"/>';
+    case 'crossing':    return '<path d="M4 22 Q18 6 32 22" fill="none" stroke="currentColor" stroke-width="2.5"/>';
   }
   return '';
 }
 
-function applyUpgrade(key) {
-  switch (key) {
-    case 'line':
-      G.assets.linesAvailable++;
-      showToast('+1 line unlocked');
-      break;
-    case 'train':
-      G.assets.trainsAvailable++;
-      showToast('+1 train');
-      break;
-    case 'carriage':
-      // attach to the train with most passengers waiting
-      G.assets.carriages++;
-      // try to auto-attach
-      autoAttachCarriage();
-      break;
-    case 'interchange':
-      G.assets.interchanges++;
-      autoApplyInterchange();
-      break;
-    case 'tunnel':
-      G.assets.tunnels += 2;
-      showToast('+2 tunnels');
-      break;
+function openShop() {
+  if (!G.running) return;
+  G.shopOpen = true;
+  G.paused = true;
+  document.getElementById('shop-overlay').classList.remove('hidden');
+  refreshShop();
+}
+
+function closeShop() {
+  G.shopOpen = false;
+  G.paused = false;
+  G.lastFrame = performance.now();
+  document.getElementById('shop-overlay').classList.add('hidden');
+}
+
+function refreshShop() {
+  const grid = document.getElementById('shop-options');
+  if (!grid) return;
+  // update cash readout
+  const cashEl = document.getElementById('shop-cash');
+  if (cashEl) cashEl.textContent = G.mode.creative ? '∞' : `${G.cash}`;
+  grid.innerHTML = '';
+  for (const key of SHOP_ORDER) {
+    const item = SHOP_ITEMS[key];
+    const cost = priceOf(key);
+    const owned = G.purchased[key] || 0;
+    const max = CFG.PRICES[key].max;
+    const soldOut = owned >= max;
+    const affordable = canBuy(key);
+    const btn = document.createElement('button');
+    btn.className = 'shop-option' + (soldOut ? ' sold-out' : '') + (!affordable && !soldOut ? ' unaffordable' : '');
+    btn.disabled = soldOut || !affordable;
+    btn.innerHTML = `
+      <span class="shop-icon">
+        <svg viewBox="0 0 36 36" width="32" height="32">${shopIconSvg(key)}</svg>
+      </span>
+      <span class="shop-body">
+        <span class="shop-name">${item.name}</span>
+        <span class="shop-desc">${item.desc}</span>
+      </span>
+      <span class="shop-price">${G.mode.creative ? 'free' : (soldOut ? 'sold out' : `${cost}¢`)}</span>
+    `;
+    btn.addEventListener('click', () => {
+      if (buy(key)) refreshShop();
+    });
+    grid.appendChild(btn);
   }
-  refreshTray();
 }
 
 function autoAttachCarriage() {
@@ -1123,20 +1674,25 @@ function autoAttachCarriage() {
 function autoApplyInterchange() {
   // upgrade the most-busy station
   const busiest = [...G.stations].sort((a, b) => b.passengers.length - a.passengers.length)[0];
-  if (busiest) {
+  if (busiest && !busiest.capacityBonus) {
     busiest.capacityBonus += 6;
     busiest.loadSpeedBonus += 0.5;
     G.assets.interchanges--;
     showToast('interchange placed');
+  } else if (busiest) {
+    // already has interchange — find next non-upgraded
+    const target = G.stations.filter(s => !s.capacityBonus).sort((a,b) => b.passengers.length - a.passengers.length)[0];
+    if (target) {
+      target.capacityBonus += 6;
+      target.loadSpeedBonus += 0.5;
+      G.assets.interchanges--;
+      showToast('interchange placed');
+    } else {
+      showToast('+1 interchange in inventory');
+    }
   } else {
     showToast('+1 interchange');
   }
-}
-
-function grantRandomUpgrade(silent) {
-  const key = choice(['train', 'tunnel', 'carriage']);
-  applyUpgrade(key);
-  if (!silent) showToast(`bonus: ${UPGRADES[key].name}`);
 }
 
 /* -------------------------------------------------------------
@@ -1149,16 +1705,29 @@ function refreshTray() {
   linesEl.innerHTML = '';
   const totalLines = CFG.STARTING_LINES + G.assets.linesAvailable;
   for (let i = 0; i < totalLines; i++) {
-    const chip = document.createElement('span');
-    chip.className = 'line-chip' + (G.usedLines.has(i) ? ' used' : '');
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    const inUse = G.usedLines.has(i);
+    chip.className = 'line-chip' + (inUse ? ' used' : '');
     chip.style.background = LINE_COLORS[i % LINE_COLORS.length];
-    chip.title = G.usedLines.has(i) ? 'in use' : 'available';
+    chip.title = inUse
+      ? (G.mode.canEdit ? 'click to remove this line' : 'in use (extreme: cannot remove)')
+      : 'available — drag from a station to use';
+    if (inUse && G.mode.canEdit) {
+      chip.classList.add('removable');
+      chip.addEventListener('click', () => {
+        const line = G.lines.find(l => l.slot === i);
+        if (line) { deleteLine(line); showToast('line removed'); refreshTray(); }
+      });
+    } else {
+      chip.disabled = true;
+    }
     linesEl.appendChild(chip);
   }
   assetsEl.innerHTML = '';
   const items = [
     ['trains', G.assets.trainsAvailable],
-    ['tunnels', G.assets.tunnels],
+    ['crossings', G.assets.tunnels],
     ['carriages', G.assets.carriages],
     ['interchanges', G.assets.interchanges],
   ];
@@ -1172,6 +1741,23 @@ function refreshTray() {
 
 function refreshHud() {
   document.getElementById('hud-score').textContent = G.score;
+  // target indicator + progress bar
+  const targetEl = document.getElementById('hud-target');
+  const barEl    = document.getElementById('hud-progress');
+  const fillEl   = document.getElementById('hud-progress-fill');
+  if (targetEl && barEl && fillEl) {
+    if (G.mode && G.mode.target > 0) {
+      targetEl.textContent = ` / ${G.mode.target}`;
+      barEl.style.display = 'block';
+      const pct = Math.min(100, Math.round((G.score / G.mode.target) * 100));
+      fillEl.style.width = pct + '%';
+    } else {
+      targetEl.textContent = '';
+      barEl.style.display = 'none';
+    }
+  }
+  const cashEl = document.getElementById('hud-cash');
+  if (cashEl) cashEl.textContent = G.mode.creative ? '∞' : `${G.cash}¢`;
   document.getElementById('hud-city').textContent = G.city ? G.city.name : '—';
   document.getElementById('hud-mode').textContent = G.modeId;
   // clock
@@ -1189,10 +1775,70 @@ function refreshHud() {
  * 12. FLOW — start, pause, end
  * ------------------------------------------------------------- */
 
+/* Spawn the first three stations of a non-creative game. Tries hard to
+   guarantee 3 stations even on small or river-heavy maps so the game
+   never starts in a dead state. */
+function spawnStarterStations() {
+  const N = 3;
+  // Round 1: normal spawn
+  for (let i = 0; i < 30 && G.stations.length < N; i++) {
+    const s = spawnStation();
+    if (s && G.stations.length <= N) s.shape = CFG.BASE_SHAPES[G.stations.length - 1];
+  }
+  // Round 2: relaxed constraints
+  for (let i = 0; i < 30 && G.stations.length < N; i++) {
+    const s = spawnStation({ relaxed: true });
+    if (s && G.stations.length <= N) s.shape = CFG.BASE_SHAPES[G.stations.length - 1];
+  }
+  // Round 3: deterministic grid fallback. Can't fail.
+  if (G.stations.length < N) {
+    const M = CFG.MAP_MARGIN;
+    const pad = 20;
+    const W = (G.width  && G.width  > 100) ? G.width  : 800;
+    const H = (G.height && G.height > 100) ? G.height : 600;
+    const cx = W / 2, cy = H / 2;
+    const r  = Math.min(W, H) * 0.22;
+    const slots = [
+      { x: cx - r,        y: cy - r * 0.3 },
+      { x: cx + r * 0.7,  y: cy - r * 0.6 },
+      { x: cx,            y: cy + r * 0.7 },
+    ];
+    for (let i = G.stations.length; i < N; i++) {
+      const slot = slots[i] || { x: cx + (i - 1) * 60, y: cy };
+      const x = Math.max(M.left + pad, Math.min(W - M.right  - pad, slot.x));
+      const y = Math.max(M.top  + pad, Math.min(H - M.bottom - pad, slot.y));
+      const n = pxToMap(x, y);
+      G.stations.push({
+        id: uid(),
+        x, y,
+        nx: n.nx, ny: n.ny,
+        shape: CFG.BASE_SHAPES[i],
+        passengers: [], overcrowdTime: 0, capacityBonus: 0, loadSpeedBonus: 0,
+      });
+      G._netDirty = true;
+    }
+  }
+}
+
 function startGame(cityId, modeId) {
   G.city = CITIES.find(c => c.id === cityId) || CITIES[0];
   G.modeId = modeId;
   G.mode = MODES[modeId];
+
+  // hide menu first so the canvas is unobscured (and so any layout-dependent
+  // measurements are taken with the playing chrome shown)
+  document.getElementById('menu').classList.add('hidden');
+  document.getElementById('hud').classList.remove('hidden');
+  document.getElementById('tray').classList.remove('hidden');
+  document.getElementById('pause-overlay').classList.add('hidden');
+  document.getElementById('gameover-overlay').classList.add('hidden');
+  document.getElementById('shop-overlay').classList.add('hidden');
+
+  // Re-measure the canvas: viewport may have changed since boot (mobile address
+  // bars settle, fonts load, etc.). This guarantees stations spawn into a
+  // canvas with correct pixel dimensions and the first frame paints visibly.
+  resizeCanvas();
+
   // reset state
   G.stations = []; G.lines = []; G.trains = [];
   G.usedLines = new Set();
@@ -1203,50 +1849,59 @@ function startGame(cityId, modeId) {
     trainsAvailable: CFG.STARTING_TRAINS,
     linesAvailable: 0,
   };
+  G.cash = CFG.STARTING_CASH;
+  G.earnings = 0;
+  G.purchased = { line: 0, train: 0, carriage: 0, interchange: 0, crossing: 0 };
   G.score = 0;
   G.weekIndex = 0;
   G.daysSinceWeek = 0;
   G.daysSinceStation = 0;
   G.time = 0;
   G.paused = false;
+  G.shopOpen = false;
+  G.victoryShown = false;
   G.speed = 1;
-  G._lastEarnTier = 0;
+  G._netDirty = true;
 
   // creative starts with no preset stations; player places them.
-  // other modes: spawn a few starter stations (basic shapes, ensure mix)
+  // other modes: spawn a few starter stations with the three base shapes
   if (!G.mode.creative) {
-    let attempts = 0;
-    while (G.stations.length < 3 && attempts < 50) {
-      attempts++;
-      const s = spawnStation();
-      if (!s) continue;
-      // force first three to be the three base shapes
-      if (G.stations.length <= 3) s.shape = CFG.BASE_SHAPES[G.stations.length - 1];
-    }
+    spawnStarterStations();
   }
-
-  // hide menu, show HUD/tray
-  document.getElementById('menu').classList.add('hidden');
-  document.getElementById('hud').classList.remove('hidden');
-  document.getElementById('tray').classList.remove('hidden');
-  document.getElementById('pause-overlay').classList.add('hidden');
-  document.getElementById('gameover-overlay').classList.add('hidden');
 
   refreshTray();
   refreshHud();
+  // paint the first frame immediately so the user sees something even before
+  // the first requestAnimationFrame tick.
+  render();
 
   G.running = true;
   G.lastFrame = performance.now();
   requestAnimationFrame(loop);
 
   savePrefs({ ...loadPrefs(), lastCity: cityId, lastMode: modeId });
+
+  // Briefing on the first game ever — quick reminder of the objective
+  const prefs = loadPrefs();
+  if (!prefs.briefingShown) {
+    setTimeout(() => {
+      showToast('drag between stations to build a line', 3000);
+    }, 400);
+    setTimeout(() => {
+      const goal = G.mode.target > 0
+        ? `goal: deliver ${G.mode.target} passengers without overcrowding.`
+        : 'deliver as many passengers as you can.';
+      showToast(goal, 4200);
+    }, 3700);
+    savePrefs({ ...prefs, briefingShown: true });
+  }
 }
 
 function pauseFor(reason) { G.paused = true; }
 function resumeFrom(reason) { G.paused = false; G.lastFrame = performance.now(); }
 
 function togglePause() {
-  if (G.pendingUpgrade) return;
+  if (G.shopOpen) { closeShop(); return; }
   G.paused = !G.paused;
   document.getElementById('pause-overlay').classList.toggle('hidden', !G.paused);
   if (!G.paused) G.lastFrame = performance.now();
@@ -1258,10 +1913,10 @@ function gameOver(reason) {
   const data = loadSaveData();
   data.stats[G.city.id] = data.stats[G.city.id] || {};
   const cs = data.stats[G.city.id];
-  cs[G.modeId] = cs[G.modeId] || { best: 0, plays: 0 };
+  cs[G.modeId] = cs[G.modeId] || { best: 0, plays: 0, completed: false };
   cs[G.modeId].best = Math.max(cs[G.modeId].best, G.score);
   cs[G.modeId].plays = (cs[G.modeId].plays || 0) + 1;
-  // unlock extreme: deliver 100+ in normal
+  // unlock extreme: deliver 100+ in normal (also automatic if completed)
   if (G.modeId === 'normal' && G.score >= 100) {
     data.unlocks[G.city.id] = data.unlocks[G.city.id] || {};
     data.unlocks[G.city.id].extreme = true;
@@ -1269,19 +1924,56 @@ function gameOver(reason) {
   writeSaveData(data);
 
   document.getElementById('result-score').textContent = G.score;
+  document.getElementById('result-earnings').textContent = G.earnings;
   document.getElementById('result-days').textContent = Math.floor(G.time / CFG.SECONDS_PER_DAY);
   document.getElementById('result-stations').textContent = G.stations.length;
   document.getElementById('gameover-reason').textContent = reason;
   document.getElementById('gameover-overlay').classList.remove('hidden');
 }
 
+/* Victory: player hit the mode's target score. Pause, record, offer
+   continue (game proceeds in endless mode) or quit. */
+function showVictory() {
+  G.paused = true;
+  // persist the completion
+  const data = loadSaveData();
+  data.stats[G.city.id] = data.stats[G.city.id] || {};
+  data.stats[G.city.id][G.modeId] = data.stats[G.city.id][G.modeId] || { best: 0, plays: 0, completed: false };
+  data.stats[G.city.id][G.modeId].completed = true;
+  data.stats[G.city.id][G.modeId].best = Math.max(data.stats[G.city.id][G.modeId].best, G.score);
+  // hitting the target in normal also unlocks extreme on this city
+  if (G.modeId === 'normal') {
+    data.unlocks[G.city.id] = data.unlocks[G.city.id] || {};
+    data.unlocks[G.city.id].extreme = true;
+  }
+  writeSaveData(data);
+
+  document.getElementById('victory-score').textContent = G.score;
+  document.getElementById('victory-target').textContent = G.mode.target;
+  document.getElementById('victory-earnings').textContent = G.earnings;
+  document.getElementById('victory-days').textContent = Math.floor(G.time / CFG.SECONDS_PER_DAY);
+  document.getElementById('victory-overlay').classList.remove('hidden');
+}
+
+/* Continue past victory — converts current run into an endless one. */
+function continuePastVictory() {
+  // flip the run into endless: the original mode flag values stay, but we
+  // mark the active run as endless so no further victory toasts fire.
+  G.mode = { ...G.mode, endless: true, target: 0 };
+  G.paused = false;
+  G.lastFrame = performance.now();
+  document.getElementById('victory-overlay').classList.add('hidden');
+}
+
 function quitToMenu() {
   G.running = false;
+  G.shopOpen = false;
   document.getElementById('hud').classList.add('hidden');
   document.getElementById('tray').classList.add('hidden');
   document.getElementById('pause-overlay').classList.add('hidden');
   document.getElementById('gameover-overlay').classList.add('hidden');
-  document.getElementById('upgrade-overlay').classList.add('hidden');
+  document.getElementById('victory-overlay').classList.add('hidden');
+  document.getElementById('shop-overlay').classList.add('hidden');
   document.getElementById('menu').classList.remove('hidden');
   updateMenuFooter();
 }
@@ -1292,12 +1984,18 @@ function quitToMenu() {
 
 function loop(now) {
   if (!G.running) return;
-  const realDt = Math.min(0.1, (now - G.lastFrame) / 1000);
-  G.lastFrame = now;
-  if (!G.paused) simStep(realDt * G.speed);
-  refreshHud();
-  refreshTray();
-  render();
+  try {
+    const realDt = Math.min(0.1, (now - G.lastFrame) / 1000);
+    G.lastFrame = now;
+    if (!G.paused) simStep(realDt * G.speed);
+    refreshHud();
+    refreshTray();
+    render();
+  } catch (err) {
+    // Never let a single bad frame kill the loop. Log and keep going.
+    console.error('freemetro loop error:', err);
+    G.lastFrame = performance.now();
+  }
   requestAnimationFrame(loop);
 }
 
@@ -1316,8 +2014,13 @@ function buildCityGrid() {
     if (prefs.lastCity === c.id) card.classList.add('selected');
     const stats = (data.stats[c.id] || {});
     const best = Math.max(...Object.values(stats).map(v => v.best || 0), 0);
+    const completedNormal  = !!(stats.normal  && stats.normal.completed);
+    const completedExtreme = !!(stats.extreme && stats.extreme.completed);
+    let badge = '';
+    if (completedExtreme) badge = '<span class="city-badge" title="extreme completed">★</span>';
+    else if (completedNormal) badge = '<span class="city-badge" title="normal completed">✓</span>';
     card.innerHTML = `
-      <span class="city-name">${c.name}</span>
+      <span class="city-name">${c.name}${badge}</span>
       <span class="city-meta">${best ? 'best ' + best : 'unplayed'}</span>
     `;
     card.addEventListener('click', () => {
@@ -1415,6 +2118,9 @@ function bindMenu() {
         }
         case 'resume': togglePause(); break;
         case 'quit': quitToMenu(); break;
+        case 'shop': openShop(); break;
+        case 'close-shop': closeShop(); break;
+        case 'continue-victory': continuePastVictory(); break;
         case 'reset-stats':
           if (confirm('Reset all statistics and unlocks?')) {
             localStorage.removeItem(SAVE_KEY);
@@ -1432,13 +2138,20 @@ function bindMenu() {
     document.getElementById('speed-label').textContent = G.speed + '×';
   });
   document.getElementById('btn-menu').addEventListener('click', togglePause);
+  const shopBtn = document.getElementById('btn-shop');
+  if (shopBtn) shopBtn.addEventListener('click', () => {
+    if (G.shopOpen) closeShop(); else openShop();
+  });
 
   // keyboard
   window.addEventListener('keydown', (e) => {
     if (!G.running) return;
     if (e.key === ' ' || e.key === 'Escape') {
       e.preventDefault();
-      togglePause();
+      if (G.shopOpen) closeShop(); else togglePause();
+    } else if (e.key === 'b' || e.key === 'B') {
+      e.preventDefault();
+      if (G.shopOpen) closeShop(); else openShop();
     }
   });
 }
@@ -1451,11 +2164,23 @@ function boot() {
   G.canvas = document.getElementById('canvas');
   G.ctx = G.canvas.getContext('2d');
   resizeCanvas();
-  window.addEventListener('resize', () => { resizeCanvas(); if (G.running) render(); });
+
+  const onResize = () => {
+    resizeCanvas();
+    if (G.running) render();
+  };
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+  // mobile chrome: visualViewport changes when the address bar shows/hides
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onResize);
+  }
+  // re-measure once after page load (CSS/fonts may have settled by then)
+  window.addEventListener('load', onResize);
+
   setupInput();
   bindMenu();
   updateMenuFooter();
-  // first render of menu state
 }
 
 document.addEventListener('DOMContentLoaded', boot);
