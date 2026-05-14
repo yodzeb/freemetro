@@ -83,6 +83,9 @@ body::before {
 #hud {
   position: fixed; top: 0; left: 0; right: 0;
   display: flex; justify-content: space-between; align-items: center;
+  /* re-enable touch action here — body sets touch-action: none for the canvas,
+     but HUD buttons need normal tap handling so the browser dispatches click. */
+  touch-action: auto;
   padding: 14px 18px;
   z-index: 5;
   pointer-events: none;
@@ -171,6 +174,8 @@ body::before {
   border-radius: 999px;
   z-index: 5;
   box-shadow: var(--shadow-card);
+  /* re-enable touch — body's touch-action:none is for the canvas */
+  touch-action: auto;
 }
 .tray-section { display: flex; align-items: center; gap: 10px; }
 .tray-section + .tray-section {
@@ -220,6 +225,27 @@ body::before {
 .line-chip.removable:hover::after { opacity: 0; }
 .line-chip:disabled { cursor: not-allowed; opacity: 0.85; }
 
+/* Wrapper that stacks the line chip on top of a busy/capacity readout. */
+.line-stat {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.line-stat-text {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  line-height: 1;
+}
+.line-stat-text.overloaded { color: #c73827; font-weight: 600; }
+@media (max-width: 700px) {
+  .line-stat-text { font-size: 8.5px; }
+}
+
 .asset-chip {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px;
@@ -234,6 +260,16 @@ body::before {
   font-weight: 500; color: var(--ink);
 }
 .asset-chip.zero { opacity: 0.4; }
+.asset-chip.clickable {
+  cursor: pointer;
+  border-color: var(--ink-soft);
+  transition: background 0.15s, border-color 0.15s;
+}
+.asset-chip.clickable:hover {
+  background: var(--paper-edge);
+  border-color: var(--ink);
+}
+.asset-chip.clickable:active { transform: scale(0.97); }
 
 /* ===== overlays ===== */
 .overlay {
@@ -245,6 +281,11 @@ body::before {
   -webkit-backdrop-filter: blur(6px);
   padding: 24px;
   animation: fadeIn 0.25s ease-out;
+  /* re-enable touch here — body sets touch-action: none for the canvas,
+     but overlay buttons need normal tap behaviour on mobile */
+  touch-action: auto;
+  /* allow inner content to scroll if the overlay is taller than the viewport */
+  overflow-y: auto;
 }
 
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }

@@ -455,11 +455,13 @@ function createLine(stationA, stationB) {
   };
   G.lines.push(line);
   G._netDirty = true;
-  // give the line a starting train if available
+  // give the new line a starting train if spares are available
   if (G.assets.trainsAvailable > 0) {
     addTrain(line.id);
     G.assets.trainsAvailable--;
   }
+  // fill any other trainless line so spares don't idle while a line goes empty
+  fillTrainlessLines();
   return line;
 }
 
@@ -519,6 +521,10 @@ function deleteLine(line) {
   G.assets.tunnels += line.crossings;
   G.lines.splice(G.lines.indexOf(line), 1);
   G._netDirty = true;
+  // Fill any other line that's now trainless, but preserve remaining spares
+  // in inventory so a future "rebuild this same line" gets back to its prior
+  // train count via createLine's "up to 2 starter trains" policy.
+  fillTrainlessLines();
 }
 
 /* Shrink a line by removing the endpoint segment on the given side.
@@ -580,6 +586,144 @@ function shrinkLine(line, end) {
   return true;
 }
 
+/* Insert a station into the middle of a line segment (creates a detour through
+   it). segIdx identifies which segment of the line: the edge from
+   line.stations[segIdx] → line.stations[segIdx+1], or for a loop the closing
+   edge stations[last] → stations[0] when segIdx === stations.length - 1.
+   Returns true on success, false otherwise (e.g. station already on line,
+   not enough crossings for water crossings). */
+function insertStationIntoSegment(line, segIdx, target) {
+  if (!G.mode.canEdit) { showToast('extreme: cannot edit'); return false; }
+  if (!line || !target) return false;
+  if (line.stations.includes(target.id)) {
+    showToast('station already on this line');
+    return false;
+  }
+
+  // Resolve the two endpoints of the segment being split
+  const sids = line.stations;
+  const isLoopEdge = line.loop && segIdx === sids.length - 1;
+  const aId = sids[segIdx];
+  const bId = isLoopEdge ? sids[0] : sids[segIdx + 1];
+  const aSt = G.stations.find(s => s.id === aId);
+  const bSt = G.stations.find(s => s.id === bId);
+  if (!aSt || !bSt) return false;
+
+  // Water-crossing accounting:
+  //   old segment A→B: if it crossed water, refund 1 crossing
+  //   new segments A→T and T→B: each crossing-of-water consumes 1 crossing
+  // Net change = (newCrossings - oldCrossings) must be ≤ G.assets.tunnels
+  const ap = { x: aSt.x, y: aSt.y };
+  const bp = { x: bSt.x, y: bSt.y };
+  const tp = { x: target.x, y: target.y };
+  const oldCrossed = segmentCrossesWater(ap, bp) ? 1 : 0;
+  const newCrossedAT = segmentCrossesWater(ap, tp) ? 1 : 0;
+  const newCrossedTB = segmentCrossesWater(tp, bp) ? 1 : 0;
+  const newCrossings = newCrossedAT + newCrossedTB;
+  const netChange = newCrossings - oldCrossed;
+  if (netChange > G.assets.tunnels) {
+    showToast('not enough crossings for detour');
+    return false;
+  }
+  // apply crossing changes
+  G.assets.tunnels -= netChange;
+  line.crossings = (line.crossings || 0) + netChange;
+
+  // Insert the target into the stations array
+  if (isLoopEdge) {
+    // loop closes from last → 0, so detour means appending to the end
+    sids.push(target.id);
+  } else {
+    sids.splice(segIdx + 1, 0, target.id);
+  }
+
+  // Trains: any train sitting at index > segIdx needs to shift up by 1 because
+  // we just inserted a new station in front of them. Trains AT segIdx
+  // (just left the now-modified segment's start station) are still valid.
+  for (const train of G.trains) {
+    if (train.lineId !== line.id) continue;
+    if (train.atIdx > segIdx) {
+      train.atIdx++;
+    }
+  }
+
+  G._netDirty = true;
+  return true;
+}
+
+/* Remove a mid-line station from a line as a detour: stations [A, B, C, D]
+   with stationId === B → [A, C, D]. Endpoints are NOT supported (they have
+   their own grip-drag shrink mechanic that handles crossing refunds correctly).
+   Crossing accounting: refund both old segments through the station; consume
+   one new segment if the bypass crosses water. Returns true on success. */
+function removeStationFromLine(line, stationId) {
+  if (!G.mode.canEdit) { showToast('extreme: cannot edit'); return false; }
+  if (!line) return false;
+  const sids = line.stations;
+  const idx = sids.indexOf(stationId);
+  if (idx === -1) return false;
+  // Endpoint: refuse — let the user use grip drag, which shrinks correctly
+  if (!line.loop && (idx === 0 || idx === sids.length - 1)) {
+    showToast('drag the line tip to shrink the end');
+    return false;
+  }
+  // For a 2-station non-loop line, there's no mid station to remove
+  if (!line.loop && sids.length < 3) return false;
+  // For a loop with only 2 stations, removing one would degenerate it
+  if (line.loop && sids.length < 3) return false;
+
+  // Resolve the two neighbors (with loop wrap if needed)
+  const prevIdx = (idx - 1 + sids.length) % sids.length;
+  const nextIdx = (idx + 1) % sids.length;
+  // For non-loop, if removing this station would leave the line bridging
+  // a gap that wasn't adjacent before, that's exactly the detour-removal case
+  // we want — the new line simply skips it.
+  const prevSt = G.stations.find(s => s.id === sids[prevIdx]);
+  const nextSt = G.stations.find(s => s.id === sids[nextIdx]);
+  const removedSt = G.stations.find(s => s.id === stationId);
+  if (!prevSt || !nextSt || !removedSt) return false;
+
+  // Crossing accounting:
+  //   refund any water-crossing on prev→removed and removed→next
+  //   consume any water-crossing on prev→next (the new bypass)
+  const prevP = { x: prevSt.x, y: prevSt.y };
+  const nextP = { x: nextSt.x, y: nextSt.y };
+  const remP  = { x: removedSt.x, y: removedSt.y };
+  const oldA = segmentCrossesWater(prevP, remP) ? 1 : 0;
+  const oldB = segmentCrossesWater(remP, nextP) ? 1 : 0;
+  const newC = segmentCrossesWater(prevP, nextP) ? 1 : 0;
+  const netChange = newC - (oldA + oldB);  // negative = refund, positive = needs more
+  if (netChange > G.assets.tunnels) {
+    showToast('not enough crossings to shortcut');
+    return false;
+  }
+  G.assets.tunnels -= netChange;
+  line.crossings = Math.max(0, (line.crossings || 0) + netChange);
+
+  // Splice out the station
+  sids.splice(idx, 1);
+
+  // Trains: any train AT or past idx needs to shift back by 1
+  for (const train of G.trains) {
+    if (train.lineId !== line.id) continue;
+    if (train.atIdx === idx) {
+      // train was sitting at the removed station — bump to its previous neighbor
+      train.atIdx = Math.max(0, idx - 1);
+      train.pos = 0;
+      train.state = 'loading';
+      train.stateTimer = 0.3;
+    } else if (train.atIdx > idx) {
+      train.atIdx--;
+    }
+    // clamp defensively
+    if (train.atIdx >= sids.length) train.atIdx = sids.length - 1;
+    if (train.atIdx < 0) train.atIdx = 0;
+  }
+
+  G._netDirty = true;
+  return true;
+}
+
 function addTrain(lineId) {
   const train = {
     id: uid(),
@@ -606,6 +750,22 @@ function addTrain(lineId) {
 /* compute station list for a line as resolved {x,y} points */
 function lineStationPoints(line) {
   return line.stations.map(id => G.stations.find(s => s.id === id)).filter(Boolean);
+}
+
+/* Count waiting passengers across all stations on a line. */
+function lineWaiting(line) {
+  return lineStationPoints(line).reduce((sum, s) => sum + (s.passengers ? s.passengers.length : 0), 0);
+}
+
+/* Total seat capacity across all trains on a line: each train's base capacity
+   plus its carriages * carriage capacity. */
+function lineCapacity(line) {
+  let cap = 0;
+  for (const t of G.trains) {
+    if (t.lineId !== line.id) continue;
+    cap += (t.capacity || CFG.TRAIN_BASE_CAPACITY) + (t.carriages || 0) * CFG.CARRIAGE_CAPACITY;
+  }
+  return cap;
 }
 
 /* -------------------------------------------------------------
@@ -652,39 +812,77 @@ function grantAsset(kind) {
   refreshTray();
 }
 
-function autoAttachTrain() {
-  if (G.lines.length === 0) {
-    showToast('+1 train (build a line first)');
-    return;
-  }
-  // Rule 1: any line without a train? give it one (any line should run).
+/* Pick the best line to receive a new train. Returns a Line or null.
+   Priority: any line without a train, then busiest line (penalty per existing train). */
+function pickBestLineForTrain() {
+  if (G.lines.length === 0) return null;
   const trainless = G.lines.filter(l => !G.trains.some(t => t.lineId === l.id));
-  let target;
   if (trainless.length > 0) {
-    // among trainless lines, pick the one with the most waiting passengers
-    target = trainless
+    return trainless
       .map(line => {
         const stations = lineStationPoints(line);
         const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
         return { line, waiting };
       })
       .sort((a, b) => b.waiting - a.waiting)[0].line;
-  } else {
-    // All lines have at least one train: add a second to the busiest line,
-    // weighting by waiting passengers minus a small penalty per existing train
-    // so we don't pile every train on one line.
-    target = G.lines
-      .map(line => {
-        const stations = lineStationPoints(line);
-        const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
-        const trains = G.trains.filter(t => t.lineId === line.id).length;
-        return { line, score: waiting - trains * 4 };
-      })
-      .sort((a, b) => b.score - a.score)[0].line;
   }
+  return G.lines
+    .map(line => {
+      const stations = lineStationPoints(line);
+      const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
+      const trains = G.trains.filter(t => t.lineId === line.id).length;
+      return { line, score: waiting - trains * 4 };
+    })
+    .sort((a, b) => b.score - a.score)[0].line;
+}
+
+function autoAttachTrain() {
+  if (G.lines.length === 0) {
+    showToast('+1 train (build a line first)');
+    return;
+  }
+  const target = pickBestLineForTrain();
+  if (!target) return;
   addTrain(target.id);
   G.assets.trainsAvailable--;
   showToast('train assigned');
+}
+
+/* Gentle: fill any line with zero trains, but never add a 2nd or 3rd train.
+   Used when creating a new line — keeps remaining spares in inventory. */
+function fillTrainlessLines() {
+  let safety = 20;
+  while (G.assets.trainsAvailable > 0 && safety-- > 0) {
+    const trainless = G.lines.filter(l => !G.trains.some(t => t.lineId === l.id));
+    if (trainless.length === 0) break;
+    const target = trainless
+      .map(line => {
+        const stations = lineStationPoints(line);
+        const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
+        return { line, waiting };
+      })
+      .sort((a, b) => b.waiting - a.waiting)[0].line;
+    addTrain(target.id);
+    G.assets.trainsAvailable--;
+  }
+}
+
+/* Aggressive: deploy ALL spare trains. Fills trainless lines first, then
+   piles onto the busiest line up to MAX_TRAINS_PER_LINE. Used after deleting
+   a line so the freed trains return to active service rather than stranding
+   in inventory. The user's scenario: line had 2 trains → deleted → recreated
+   → that line gets both trains back (or one train + one to busiest other line). */
+function redistributeIdleTrains() {
+  const MAX_TRAINS_PER_LINE = 4;
+  let safety = 50;
+  while (G.assets.trainsAvailable > 0 && G.lines.length > 0 && safety-- > 0) {
+    const target = pickBestLineForTrain();
+    if (!target) break;
+    const existing = G.trains.filter(t => t.lineId === target.id).length;
+    if (existing >= MAX_TRAINS_PER_LINE) break;
+    addTrain(target.id);
+    G.assets.trainsAvailable--;
+  }
 }
 
 /* Count distinct lines that pass through a station. */
@@ -720,8 +918,13 @@ function payForDelivery(shape) {
 
 function simStep(dt) {
   // dt in real seconds; in-game time scales by 1/SECONDS_PER_DAY days/sec
+  // Defensive: if dt is somehow NaN or negative, clamp to 0 — better to skip
+  // a frame than poison G.time with NaN (which then crashes refreshHud).
+  if (typeof dt !== 'number' || !isFinite(dt) || dt < 0) dt = 0;
   const dayDt = dt / CFG.SECONDS_PER_DAY;
   G.time += dt;
+  // sanity guard: if G.time has gone non-finite for any reason, reset
+  if (!isFinite(G.time) || G.time < 0) G.time = 0;
 
   // ensure reachability cache is current
   if (G._netDirty) { recomputeReachability(); G._netDirty = false; }
@@ -1027,10 +1230,35 @@ function render() {
   // chrome. Otherwise the first ~13px of the dashed line (covered by the start
   // station) is invisible, which on short drags makes the whole preview look
   // missing.
-  if (G.drag && G.drag.kind === 'newline') drawDragPreview(ctx);
+  if (G.drag && (G.drag.kind === 'newline' || G.drag.kind === 'detour')) drawDragPreview(ctx);
   if (G.deletePrompt) drawDeletePrompt(ctx);
+  if (G.trainPrompt) drawTrainPrompt(ctx);
+  if (G.stationPrompt) drawStationPrompt(ctx);
+  if (G._tapFlash) drawTapFlash(ctx);
 
   if (G.mode.creative) drawCreativeHint(ctx);
+}
+
+/* Brief expanding-ring at the tap point so the player gets visual feedback
+   that their touch registered — important on phones where there's no
+   cursor to indicate where the OS thinks the touch landed. */
+function drawTapFlash(ctx) {
+  const tf = G._tapFlash;
+  if (!tf) return;
+  const age = (performance.now() - tf.t) / 1000;  // seconds
+  const lifeSec = 0.35;
+  if (age > lifeSec) { G._tapFlash = null; return; }
+  const t = age / lifeSec;                 // 0..1
+  const r = 8 + t * 22;                    // grow from 8 to 30 px
+  const alpha = (1 - t) * 0.55;            // fade out
+  ctx.save();
+  ctx.strokeStyle = getCss('--ink');
+  ctx.globalAlpha = alpha;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(tf.x, tf.y, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
 }
 
 /* Floating "delete this line" prompt rendered on canvas. Tracks its hit-rect
@@ -1073,6 +1301,217 @@ function drawDeletePrompt(ctx) {
   ctx.restore();
   // store hit rect for click detection
   G._deletePromptRect = { x: left, y: top, w: totalW, h: totalH };
+}
+
+/* Floating "move train to..." prompt with a coloured chip per available
+   destination line plus an "× return" chip to send the train to inventory.
+   Hit rects stored in G._trainPromptHits as [{x, y, w, h, action}, ...]. */
+function drawTrainPrompt(ctx) {
+  const tp = G.trainPrompt;
+  if (!tp) return;
+  // Two modes:
+  //   source 'train'      → moving an existing train (chips for other lines + return-to-inventory)
+  //   source 'inventory'  → assigning a spare train to a line (chips for all lines, no inventory option)
+  const source = tp.source || 'train';
+
+  let options, labelText;
+  if (source === 'train') {
+    if (!tp.train) return;
+    const train = tp.train;
+    const otherLines = G.lines.filter(l => l.id !== train.lineId);
+    options = [
+      ...otherLines.map(l => ({ kind: 'move', lineId: l.id, color: l.color })),
+      { kind: 'inventory', color: null },
+    ];
+    labelText = 'move train';
+  } else {
+    // inventory mode: pick any line to assign to
+    options = G.lines.map(l => ({ kind: 'assign', lineId: l.id, color: l.color }));
+    labelText = 'assign to';
+  }
+  if (options.length === 0) { G._trainPromptHits = []; return; }
+
+  ctx.save();
+  ctx.font = '600 11px IBM Plex Mono, monospace';
+  const labelW = ctx.measureText(labelText).width;
+  const chipR = 11;             // chip radius (so chip diameter = 22px touch target)
+  const chipGap = 8;
+  const padX = 12, padY = 9;
+  // total width: label + gap + N chips + gaps
+  const chipsW = options.length * (chipR * 2) + (options.length - 1) * chipGap;
+  const totalW = padX + labelW + 12 + chipsW + padX;
+  const totalH = chipR * 2 + padY * 2;
+
+  // position above the anchor, clamped to viewport
+  let cx = tp.x;
+  let cy = tp.y - 28;
+  cy = Math.max(totalH / 2 + 8, cy);
+  cy = Math.min(G.height - totalH / 2 - 8, cy);
+  cx = Math.max(totalW / 2 + 8, cx);
+  cx = Math.min(G.width - totalW / 2 - 8, cx);
+  const left = cx - totalW / 2;
+  const top  = cy - totalH / 2;
+
+  // bg
+  roundRect(ctx, left, top, totalW, totalH, totalH / 2);
+  ctx.fillStyle = getCss('--ink');
+  ctx.fill();
+
+  // label
+  ctx.fillStyle = getCss('--paper');
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText(labelText, left + padX, top + totalH / 2);
+
+  // chips
+  const hits = [];
+  let chipX = left + padX + labelW + 12 + chipR;
+  const chipY = top + totalH / 2;
+  for (const opt of options) {
+    ctx.beginPath();
+    ctx.arc(chipX, chipY, chipR, 0, Math.PI * 2);
+    if (opt.kind === 'move' || opt.kind === 'assign') {
+      ctx.fillStyle = opt.color;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = getCss('--paper');
+      ctx.stroke();
+    } else {
+      // "× inventory" chip — outlined, no fill
+      ctx.fillStyle = 'transparent';
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = getCss('--paper');
+      ctx.stroke();
+      // X glyph
+      ctx.beginPath();
+      ctx.moveTo(chipX - 4, chipY - 4);
+      ctx.lineTo(chipX + 4, chipY + 4);
+      ctx.moveTo(chipX + 4, chipY - 4);
+      ctx.lineTo(chipX - 4, chipY + 4);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = getCss('--paper');
+      ctx.stroke();
+    }
+    hits.push({ x: chipX - chipR, y: chipY - chipR, w: chipR * 2, h: chipR * 2, opt });
+    chipX += chipR * 2 + chipGap;
+  }
+  ctx.restore();
+  G._trainPromptHits = hits;
+  G._trainPromptRect = { x: left, y: top, w: totalW, h: totalH };
+}
+
+/* Station inspection prompt: shows for each line passing through the tapped
+   station the line's busyness and capacity, plus an × chip to remove the
+   station from that line as a detour (mid-line stations only — endpoints
+   are reachable via the grip-drag shrink mechanic). */
+function drawStationPrompt(ctx) {
+  const sp = G.stationPrompt;
+  if (!sp || !sp.station) return;
+  const st = sp.station;
+  // Find every line passing through this station, plus whether it's an endpoint
+  const linesThrough = G.lines.filter(l => l.stations.includes(st.id));
+
+  ctx.save();
+  ctx.font = '600 11px IBM Plex Mono, monospace';
+
+  const padX = 12, padY = 9;
+  const rowH = 22;
+  const chipR = 9;
+  const swatchSz = 12;
+  const gap = 8;
+
+  // Build rows. Each row has: [colour swatch] [busy/cap text] [× chip if removable]
+  // For a station with NO lines through it: a single info row "isolated".
+  const rows = [];
+  if (linesThrough.length === 0) {
+    rows.push({ kind: 'info', text: `${(st.passengers || []).length} waiting` });
+  } else {
+    for (const line of linesThrough) {
+      const sids = line.stations;
+      const idx = sids.indexOf(st.id);
+      const isEndpoint = !line.loop && (idx === 0 || idx === sids.length - 1);
+      const removable = !isEndpoint && G.mode.canEdit && (line.loop ? sids.length > 2 : sids.length > 2);
+      rows.push({
+        kind: 'line',
+        line, color: line.color,
+        text: `${lineWaiting(line)}/${lineCapacity(line)}`,
+        removable, isEndpoint,
+      });
+    }
+  }
+
+  // Measure max row width (for layout)
+  const textWidths = rows.map(r => ctx.measureText(r.text || '').width);
+  const maxTextW = Math.max(0, ...textWidths);
+  const rowContentW = swatchSz + gap + maxTextW + gap + (chipR * 2);
+  const totalW = padX + rowContentW + padX;
+  const totalH = padY + rows.length * rowH + padY;
+
+  // Position above the station, clamped
+  let cx = sp.x;
+  let cy = sp.y - 14 - totalH / 2;
+  cy = Math.max(totalH / 2 + 8, cy);
+  cy = Math.min(G.height - totalH / 2 - 8, cy);
+  cx = Math.max(totalW / 2 + 8, cx);
+  cx = Math.min(G.width - totalW / 2 - 8, cx);
+  const left = cx - totalW / 2;
+  const top  = cy - totalH / 2;
+
+  // bg
+  roundRect(ctx, left, top, totalW, totalH, 12);
+  ctx.fillStyle = getCss('--ink');
+  ctx.fill();
+
+  // Draw each row
+  const hits = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const ry = top + padY + i * rowH + rowH / 2;
+    const rx = left + padX;
+    if (row.kind === 'info') {
+      ctx.fillStyle = getCss('--paper');
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillText(row.text, rx, ry);
+      continue;
+    }
+    // colour swatch (small filled circle in the line's color)
+    ctx.beginPath();
+    ctx.arc(rx + swatchSz / 2, ry, swatchSz / 2, 0, Math.PI * 2);
+    ctx.fillStyle = row.color;
+    ctx.fill();
+    // text "X/Y"
+    ctx.fillStyle = getCss('--paper');
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillText(row.text, rx + swatchSz + gap, ry);
+    // remove chip (× outlined) if removable
+    if (row.removable) {
+      const chipX = rx + rowContentW - chipR;
+      const chipY = ry;
+      ctx.beginPath();
+      ctx.arc(chipX, chipY, chipR, 0, Math.PI * 2);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = getCss('--paper');
+      ctx.stroke();
+      // X glyph
+      ctx.beginPath();
+      ctx.moveTo(chipX - 3.5, chipY - 3.5);
+      ctx.lineTo(chipX + 3.5, chipY + 3.5);
+      ctx.moveTo(chipX + 3.5, chipY - 3.5);
+      ctx.lineTo(chipX - 3.5, chipY + 3.5);
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      hits.push({
+        x: chipX - chipR, y: chipY - chipR, w: chipR * 2, h: chipR * 2,
+        kind: 'remove', lineId: row.line.id,
+      });
+    }
+  }
+
+  ctx.restore();
+  G._stationPromptHits = hits;
+  G._stationPromptRect = { x: left, y: top, w: totalW, h: totalH };
 }
 
 function drawWater(ctx) {
@@ -1193,6 +1632,12 @@ function drawLines(ctx) {
 
 function drawDragPreview(ctx) {
   const d = G.drag;
+  // detour: dashed A→cursor→B preview, where A, B are the two stations of the
+  // segment being rerouted through the cursor.
+  if (d.kind === 'detour') {
+    drawDetourPreview(ctx);
+    return;
+  }
   if (!d.fromStation && !d.fromLineEnd) return;
   const a = d.fromStation || G.stations.find(s => s.id === d.fromLineEnd.stationId);
   if (!a) return;
@@ -1235,6 +1680,63 @@ function drawDragPreview(ctx) {
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(cx, cy, hover ? 7 : 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+/* Detour preview: shows the rubber-banded path A → cursor → B that the user
+   is creating by dragging the middle of a segment toward another station. */
+function drawDetourPreview(ctx) {
+  const d = G.drag;
+  if (!d.line) return;
+  const sids = d.line.stations;
+  const isLoopEdge = d.line.loop && d.segIdx === sids.length - 1;
+  const aId = sids[d.segIdx];
+  const bId = isLoopEdge ? sids[0] : sids[d.segIdx + 1];
+  const aSt = G.stations.find(s => s.id === aId);
+  const bSt = G.stations.find(s => s.id === bId);
+  if (!aSt || !bSt) return;
+  const tx = d.cursorX, ty = d.cursorY;
+  const hover = stationAt(tx, ty);
+  // snap to hovered station and check it's not already on the line
+  const snapValid = hover && !sids.includes(hover.id);
+  const cx = hover ? hover.x : tx;
+  const cy = hover ? hover.y : ty;
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  // halo behind both segments
+  ctx.strokeStyle = getCss('--paper');
+  ctx.lineWidth = 10;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(aSt.x, aSt.y);
+  ctx.lineTo(cx, cy);
+  ctx.lineTo(bSt.x, bSt.y);
+  ctx.stroke();
+
+  // dashed detour in the line's colour
+  ctx.strokeStyle = d.color || getCss('--ink');
+  ctx.lineWidth = 5;
+  ctx.setLineDash([10, 7]);
+  ctx.lineDashOffset = -((performance.now() / 60) % 17);
+  ctx.beginPath();
+  ctx.moveTo(aSt.x, aSt.y);
+  ctx.lineTo(cx, cy);
+  ctx.lineTo(bSt.x, bSt.y);
+  ctx.stroke();
+
+  // cursor marker — bigger / accent if snapped to a valid target station
+  ctx.setLineDash([]);
+  ctx.fillStyle = snapValid ? (d.color || getCss('--ink')) : getCss('--paper');
+  ctx.strokeStyle = d.color || getCss('--ink');
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, snapValid ? 9 : 5, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
 
@@ -1489,6 +1991,9 @@ function drawTrains(ctx) {
     const x = a.x + (b.x - a.x) * train.pos + px * off;
     const y = a.y + (b.y - a.y) * train.pos + py * off;
     const angle = Math.atan2(b.y - a.y, b.x - a.x);
+    // cache screen position for hit-detection (e.g. tap-to-move)
+    train._screenX = x;
+    train._screenY = y;
 
     ctx.save();
     ctx.translate(x, y);
@@ -1554,8 +2059,15 @@ function pointerPos(e) {
 }
 
 function stationAt(x, y) {
+  // On coarse-pointer (touch) devices use a wider hit radius — fingers are
+  // much less precise than a mouse cursor. Cached on first call.
+  if (G._hitRadius === undefined) {
+    const coarse = (typeof window !== 'undefined' && window.matchMedia &&
+                    window.matchMedia('(pointer: coarse)').matches);
+    G._hitRadius = coarse ? CFG.HIT_RADIUS + 8 : CFG.HIT_RADIUS;
+  }
   for (const s of G.stations) {
-    if (dist(s.x, s.y, x, y) <= CFG.HIT_RADIUS) return s;
+    if (dist(s.x, s.y, x, y) <= G._hitRadius) return s;
   }
   return null;
 }
@@ -1564,6 +2076,8 @@ function lineEndpointAt(x, y) {
   // Match a comfortable area centered on the wedge grip. Lets a user start a
   // new line from the endpoint station body itself (the body is NOT part of
   // the grip hit-area).
+  const coarse = G._hitRadius && G._hitRadius > CFG.HIT_RADIUS;
+  const gripTol = coarse ? 24 : 16;
   for (const line of G.lines) {
     if (line.loop) continue;
     const pts = lineStationPoints(line);
@@ -1580,7 +2094,7 @@ function lineEndpointAt(x, y) {
       const centerDist = CFG.STATION_RADIUS + 11;
       const gx = e.p.x + ux * centerDist;
       const gy = e.p.y + uy * centerDist;
-      if (dist(gx, gy, x, y) <= 16) {
+      if (dist(gx, gy, x, y) <= gripTol) {
         return { line, stationId: e.stationId, end: e.end };
       }
     }
@@ -1589,12 +2103,32 @@ function lineEndpointAt(x, y) {
 }
 
 function lineSegmentAt(x, y) {
+  const coarse = G._hitRadius && G._hitRadius > CFG.HIT_RADIUS;
+  const TOL = coarse ? 16 : 10;
   for (const line of G.lines) {
     const pts = lineStationPoints(line);
     for (let i = 0; i < pts.length - 1; i++) {
       const proj = projectOnSegment({x, y}, pts[i], pts[i+1]);
-      if (dist(proj.x, proj.y, x, y) < 8) return line;
+      if (dist(proj.x, proj.y, x, y) < TOL) return { line, segIdx: i, projX: proj.x, projY: proj.y };
     }
+    // also check the loop-closing segment if applicable
+    if (line.loop && pts.length >= 2) {
+      const i = pts.length - 1;
+      const proj = projectOnSegment({x, y}, pts[i], pts[0]);
+      if (dist(proj.x, proj.y, x, y) < TOL) return { line, segIdx: i, projX: proj.x, projY: proj.y };
+    }
+  }
+  return null;
+}
+
+/* Find a train whose rendered position is close to (x, y). Trains move, so
+   we use the cached screen position from drawTrains (set each render frame). */
+function trainAt(x, y) {
+  const coarse = G._hitRadius && G._hitRadius > CFG.HIT_RADIUS;
+  const tol = coarse ? 20 : 14;
+  for (const train of G.trains) {
+    if (typeof train._screenX !== 'number') continue;
+    if (dist(train._screenX, train._screenY, x, y) <= tol) return train;
   }
   return null;
 }
@@ -1630,7 +2164,31 @@ function setupInput() {
 function onPointerDown(e) {
   if (!G.running) return;
   // NOTE: paused is allowed — players can redesign their network while paused
+
+  // Single-pointer enforcement: mobile fires multiple pointer events when the
+  // user has more than one finger down (or accidentally brushes the screen).
+  // Lock onto the first pointer; ignore the rest until it lifts. This stops
+  // a stray second finger from cancelling or hijacking the user's drag.
+  if (G._activePointerId !== undefined && G._activePointerId !== e.pointerId) {
+    return;
+  }
+  G._activePointerId = e.pointerId;
+
+  // Prevent the browser from initiating gestures (long-press menu, text
+  // selection, double-tap zoom etc.) when the touch lands on the canvas.
+  // The canvas has touch-action: none too, but preventDefault here is a
+  // belt-and-braces guard for mobile Chrome which occasionally fires
+  // pointerdown WITH default action despite touch-action.
+  if (e.cancelable) {
+    try { e.preventDefault(); } catch {}
+  }
+
   const p = pointerPos(e);
+
+  // visual tap feedback: a brief expanding ring at the tap point. Helps the
+  // user confirm the tap was registered, especially on touch where there's
+  // no cursor.
+  G._tapFlash = { x: p.x, y: p.y, t: performance.now() };
 
   // capture this pointer so move/up events keep firing on the canvas even if
   // the user drags the cursor off the canvas onto the HUD or tray.
@@ -1638,8 +2196,74 @@ function onPointerDown(e) {
     try { G.canvas.setPointerCapture(e.pointerId); } catch {}
   }
 
-  // FIRST: if a delete prompt is showing and the click hits it, confirm delete.
-  // If the click is outside, dismiss the prompt and continue handling normally.
+  // FIRST: if a train-move/assign prompt is showing, check chip hits before anything else
+  if (G.trainPrompt && G._trainPromptHits) {
+    for (const hit of G._trainPromptHits) {
+      if (p.x >= hit.x && p.x <= hit.x + hit.w && p.y >= hit.y && p.y <= hit.y + hit.h) {
+        const train = G.trainPrompt.train;
+        if (hit.opt.kind === 'move' && train && G.trains.includes(train)) {
+          // reassign train to the chosen line
+          train.lineId = hit.opt.lineId;
+          train.atIdx = 0;
+          train.pos = 0;
+          train.dir = 1;
+          train.passengers = [];  // drop any in-transit passengers (they'll re-spawn)
+          train.state = 'loading';
+          train.stateTimer = 0.5;
+          showToast('train reassigned');
+        } else if (hit.opt.kind === 'inventory' && train && G.trains.includes(train)) {
+          // return to inventory; carriages also return
+          G.assets.trainsAvailable++;
+          G.assets.carriages += (train.carriages || 0);
+          G.trains.splice(G.trains.indexOf(train), 1);
+          showToast('train returned to inventory');
+        } else if (hit.opt.kind === 'assign' && G.assets.trainsAvailable > 0) {
+          // assign one spare train from inventory to the chosen line
+          addTrain(hit.opt.lineId);
+          G.assets.trainsAvailable--;
+          showToast('train assigned');
+          refreshTray();
+        }
+        G.trainPrompt = null; G._trainPromptHits = null; G._trainPromptRect = null;
+        if (G.ctx) render();
+        return;
+      }
+    }
+    // tap outside chips → dismiss
+    G.trainPrompt = null; G._trainPromptHits = null; G._trainPromptRect = null;
+  }
+
+  // SECOND: if a station prompt is showing, check × chip hits.
+  if (G.stationPrompt && G._stationPromptHits) {
+    for (const hit of G._stationPromptHits) {
+      if (p.x >= hit.x && p.x <= hit.x + hit.w && p.y >= hit.y && p.y <= hit.y + hit.h) {
+        const st = G.stationPrompt.station;
+        const line = G.lines.find(l => l.id === hit.lineId);
+        if (line && st) {
+          const ok = removeStationFromLine(line, st.id);
+          if (ok) showToast('detour removed');
+        }
+        G.stationPrompt = null; G._stationPromptHits = null; G._stationPromptRect = null;
+        if (G.ctx) render();
+        return;
+      }
+    }
+    // outside any chip — dismiss the prompt and continue handling
+    if (G._stationPromptRect) {
+      const r = G._stationPromptRect;
+      const insidePill = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+      G.stationPrompt = null; G._stationPromptHits = null; G._stationPromptRect = null;
+      if (insidePill) {
+        // tap inside pill but not on a chip — just dismiss, don't fall through
+        if (G.ctx) render();
+        return;
+      }
+    } else {
+      G.stationPrompt = null; G._stationPromptHits = null; G._stationPromptRect = null;
+    }
+  }
+
+  // THIRD: if a delete prompt is showing and the click hits it, confirm delete.
   if (G.deletePrompt && G._deletePromptRect) {
     const r = G._deletePromptRect;
     const hit = p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
@@ -1674,31 +2298,57 @@ function onPointerDown(e) {
     return;
   }
 
-  // station — start a new line
+  // station — start a new line. ALSO record the tap so a no-movement
+  // pointerup can pop the station inspection / remove-from-line prompt.
   const st = stationAt(p.x, p.y);
   if (st) {
     const slot = freeLineSlot();
-    if (slot < 0) { showToast('no free lines'); return; }
-    G.drag = {
-      kind: 'newline',
-      fromStation: st,
-      color: LINE_COLORS[slot % LINE_COLORS.length],
-      cursorX: p.x, cursorY: p.y,
-    };
+    if (slot >= 0) {
+      G.drag = {
+        kind: 'newline',
+        fromStation: st,
+        color: LINE_COLORS[slot % LINE_COLORS.length],
+        cursorX: p.x, cursorY: p.y,
+      };
+    }
+    // Record tap intent regardless of whether a drag was set up. If the user
+    // moves enough we'll commit a new line; if not, pointerup shows the
+    // station prompt. This way a station with no free line slots still
+    // responds to taps with the inspection prompt.
+    G._tapDownStation = { station: st, x: p.x, y: p.y, moved: false };
     return;
   }
 
-  // empty space — record possible tap-on-line for deletion
+  // train — open the move-train prompt
+  const tr = trainAt(p.x, p.y);
+  if (tr && G.mode.canEdit) {
+    G.trainPrompt = { train: tr, x: tr._screenX, y: tr._screenY };
+    if (G.ctx) render();
+    return;
+  }
+
+  // empty space — record possible tap-on-line. If user releases without
+  // moving, this becomes a delete prompt; if they drag, it becomes a detour.
   const onLine = lineSegmentAt(p.x, p.y);
   if (onLine && G.mode.canEdit) {
-    G._tapDown = { line: onLine, x: p.x, y: p.y, moved: false };
+    G._tapDown = { line: onLine.line, segIdx: onLine.segIdx, x: p.x, y: p.y, moved: false };
   } else {
     G._tapDown = null;
   }
 }
 
 function onPointerMove(e) {
+  // Only honour moves from the currently-tracked pointer. This stops a stray
+  // second finger from corrupting drag coordinates mid-gesture.
+  if (e && e.pointerId !== undefined && G._activePointerId !== undefined &&
+      e.pointerId !== G._activePointerId) {
+    return;
+  }
   const p = pointerPos(e);
+  // touch devices have wobblier "stationary" gestures than mouse — broader
+  // tap-vs-drag threshold so a still finger doesn't accidentally promote to drag
+  const coarse = G._hitRadius && G._hitRadius > CFG.HIT_RADIUS;
+  const tapTol2 = coarse ? 196 : 64;  // squared: 14px vs 8px
   if (G.drag) {
     G.drag.cursorX = p.x;
     G.drag.cursorY = p.y;
@@ -1709,12 +2359,36 @@ function onPointerMove(e) {
   }
   if (G._tapDown) {
     const dx = p.x - G._tapDown.x, dy = p.y - G._tapDown.y;
-    if (dx*dx + dy*dy > 64) G._tapDown.moved = true;  // 8px tolerance
+    if (dx*dx + dy*dy > tapTol2) G._tapDown.moved = true;
+    // If a tap-down on a line segment has clearly become a drag, promote it
+    // to a detour drag — user wants to insert a station mid-segment.
+    if (G._tapDown.moved && !G.drag && G._tapDown.line) {
+      G.drag = {
+        kind: 'detour',
+        line: G._tapDown.line,
+        segIdx: G._tapDown.segIdx,
+        color: G._tapDown.line.color,
+        cursorX: p.x, cursorY: p.y,
+      };
+      G._tapDown = null;
+      if (G.running && G.ctx) render();
+    }
+  }
+  if (G._tapDownStation) {
+    const dx = p.x - G._tapDownStation.x, dy = p.y - G._tapDownStation.y;
+    if (dx*dx + dy*dy > tapTol2) G._tapDownStation.moved = true;
   }
   G.hover = stationAt(p.x, p.y);
 }
 
 function onPointerUp(e) {
+  // Single-pointer lock: only the originally-tracked pointer's lift counts
+  // as a release. Other simultaneous pointers' events are ignored.
+  if (e && e.pointerId !== undefined && G._activePointerId !== undefined &&
+      e.pointerId !== G._activePointerId) {
+    return;
+  }
+  G._activePointerId = undefined;
   if (e && e.pointerId !== undefined) {
     try { G.canvas.releasePointerCapture(e.pointerId); } catch {}
   }
@@ -1722,16 +2396,36 @@ function onPointerUp(e) {
   if (!G.drag && G._tapDown && !G._tapDown.moved) {
     G.deletePrompt = { line: G._tapDown.line, x: G._tapDown.x, y: G._tapDown.y };
     G._tapDown = null;
+    G._tapDownStation = null;
+    if (G.running && G.ctx) render();
+    return;
+  }
+  // Tap on a station with no movement → show station prompt (line stats + remove)
+  if (G._tapDownStation && !G._tapDownStation.moved) {
+    const st = G._tapDownStation.station;
+    G._tapDownStation = null;
+    G._tapDown = null;
+    G.drag = null;  // cancel any pending newline drag from this tap
+    G.stationPrompt = { station: st, x: st.x, y: st.y };
     if (G.running && G.ctx) render();
     return;
   }
   G._tapDown = null;
+  G._tapDownStation = null;
   if (!G.drag) return;
   try {
     const p = pointerPos(e);
     const target = stationAt(p.x, p.y);
 
-    if (G.drag.fromStation && target && target.id !== G.drag.fromStation.id) {
+    if (G.drag.kind === 'detour') {
+      // detour: insert target station mid-segment of G.drag.line
+      const line = G.drag.line;
+      const segIdx = G.drag.segIdx;
+      if (target && line && G.lines.includes(line)) {
+        const insertResult = insertStationIntoSegment(line, segIdx, target);
+        if (insertResult) showToast('detour added');
+      }
+    } else if (G.drag.fromStation && target && target.id !== G.drag.fromStation.id) {
       // creating a brand-new line from an empty station to another station
       createLine(G.drag.fromStation, target);
     } else if (G.drag.fromLineEnd) {
@@ -1792,7 +2486,7 @@ function onDoubleClick(e) {
 const SHOP_ITEMS = {
   line:        { name: 'New Line', desc: 'unlock another colour line' },
   train:       { name: 'Train', desc: 'goes to a line that has none yet' },
-  carriage:    { name: 'Carriage', desc: '+6 seats on busiest train' },
+  carriage:    { name: 'Carriage', desc: '+6 seats on the train with fewest carriages' },
   interchange: { name: 'Interchange', desc: '+capacity at biggest transfer hub' },
   crossing:    { name: 'Crossing', desc: 'bridge or tunnel for water' },
 };
@@ -1860,27 +2554,35 @@ function refreshShop() {
 }
 
 function autoAttachCarriage() {
-  // attach to train of busiest line (most total passengers waiting)
-  const busiest = G.lines
-    .map(line => {
-      const stations = lineStationPoints(line);
-      const waiting = stations.reduce((sum, s) => sum + s.passengers.length, 0);
-      return { line, waiting };
-    })
-    .sort((a, b) => b.waiting - a.waiting)[0];
-  if (busiest) {
-    const t = G.trains.find(t => t.lineId === busiest.line.id);
-    if (t) {
-      t.carriages++;
-      G.assets.carriages--;
-      showToast('carriage attached');
-      return;
-    }
+  if (G.assets.carriages <= 0) return;
+  if (G.trains.length === 0) {
+    showToast('+1 carriage in inventory');
+    return;
   }
-  showToast('+1 carriage in inventory');
+  // Compute waiting passengers per line (used as tiebreaker / weight)
+  const waitByLine = new Map();
+  for (const line of G.lines) {
+    waitByLine.set(line.id, lineWaiting(line));
+  }
+  // Pick the train with the FEWEST carriages so additions spread across the
+  // fleet rather than always growing the same train. Tiebreaker: train on the
+  // busier line (more passengers waiting) gets it first, since that's where
+  // capacity matters most.
+  const ranked = G.trains
+    .map(t => ({
+      train: t,
+      carriages: t.carriages || 0,
+      waiting: waitByLine.get(t.lineId) || 0,
+    }))
+    .sort((a, b) => (a.carriages - b.carriages) || (b.waiting - a.waiting));
+  const target = ranked[0].train;
+  target.carriages++;
+  G.assets.carriages--;
+  showToast('carriage attached');
 }
 
 function autoApplyInterchange() {
+  if (G.assets.interchanges <= 0) return;
   if (G.stations.length === 0) {
     showToast('+1 interchange');
     return;
@@ -1917,39 +2619,124 @@ function autoApplyInterchange() {
 function refreshTray() {
   const linesEl = document.getElementById('tray-lines');
   const assetsEl = document.getElementById('tray-assets');
+  // Set up event delegation ONCE per element. The tray DOM is rebuilt every
+  // frame so per-element click listeners would fire unreliably (a chip the
+  // user pointed-down on might be replaced by the next frame before the
+  // click event resolves). Delegation on the parent container survives any
+  // amount of inner rebuilding.
+  if (!linesEl._delegated) {
+    // Use pointerup (not click) — more reliable on touch devices, especially
+    // with touch-action: none on body which can suppress click synthesis.
+    const handler = (e) => {
+      const chip = e.target.closest('.line-chip.removable');
+      if (!chip) return;
+      e.preventDefault();
+      const slot = parseInt(chip.dataset.slot, 10);
+      if (!isNaN(slot)) {
+        const line = G.lines.find(l => l.slot === slot);
+        if (line) { deleteLine(line); showToast('line removed'); refreshTray(); render(); }
+      }
+    };
+    linesEl.addEventListener('pointerup', handler);
+    linesEl.addEventListener('click', handler);  // desktop fallback
+    linesEl._delegated = true;
+  }
+  if (!assetsEl._delegated) {
+    const handler = (e) => {
+      const chip = e.target.closest('.asset-chip.clickable');
+      if (!chip) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // dedupe: pointerup will fire first on touch; click follows. Skip the
+      // click if we just handled the pointerup for the same gesture.
+      if (e.type === 'click' && assetsEl._lastHandled && Date.now() - assetsEl._lastHandled < 500) return;
+      assetsEl._lastHandled = Date.now();
+
+      const kind = chip.dataset.kind;
+      if (kind === 'train') {
+        if (G.lines.length === 0) { showToast('build a line first'); return; }
+        if (G.assets.trainsAvailable <= 0) return;
+        const rect = chip.getBoundingClientRect();
+        const canvasRect = G.canvas.getBoundingClientRect();
+        G.trainPrompt = {
+          source: 'inventory',
+          x: rect.left + rect.width / 2 - canvasRect.left,
+          y: rect.top - canvasRect.top,
+        };
+        if (G.ctx) render();
+      } else if (kind === 'carriage') {
+        autoAttachCarriage();
+        refreshTray();
+      } else if (kind === 'interchange') {
+        autoApplyInterchange();
+        refreshTray();
+      }
+    };
+    assetsEl.addEventListener('pointerup', handler);
+    assetsEl.addEventListener('click', handler);  // desktop fallback
+    assetsEl._delegated = true;
+  }
+
   linesEl.innerHTML = '';
   const totalLines = CFG.STARTING_LINES + G.assets.linesAvailable;
   for (let i = 0; i < totalLines; i++) {
-    const chip = document.createElement('button');
-    chip.type = 'button';
     const inUse = G.usedLines.has(i);
-    chip.className = 'line-chip' + (inUse ? ' used' : '');
-    chip.style.background = LINE_COLORS[i % LINE_COLORS.length];
-    chip.title = inUse
-      ? (G.mode.canEdit ? 'click to remove this line' : 'in use (extreme: cannot remove)')
-      : 'available — drag from a station to use';
-    if (inUse && G.mode.canEdit) {
-      chip.classList.add('removable');
-      chip.addEventListener('click', () => {
-        const line = G.lines.find(l => l.slot === i);
-        if (line) { deleteLine(line); showToast('line removed'); refreshTray(); }
-      });
+    const line = inUse ? G.lines.find(l => l.slot === i) : null;
+    if (inUse && line) {
+      // wrap chip + stats label vertically. The wrapper carries data-slot so
+      // tapping anywhere on it (including the stats label) still hits the
+      // delegated click handler.
+      const wrap = document.createElement('div');
+      wrap.className = 'line-stat';
+      wrap.dataset.slot = String(i);
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'line-chip used' + (G.mode.canEdit ? ' removable' : '');
+      chip.style.background = LINE_COLORS[i % LINE_COLORS.length];
+      chip.dataset.slot = String(i);
+      chip.title = G.mode.canEdit ? 'click to remove this line' : 'in use (extreme: cannot remove)';
+      if (!G.mode.canEdit) chip.disabled = true;
+      wrap.appendChild(chip);
+      const stat = document.createElement('span');
+      stat.className = 'line-stat-text';
+      const w = lineWaiting(line);
+      const c = lineCapacity(line);
+      stat.textContent = `${w}/${c}`;
+      // tint red if waiting > capacity (overloaded)
+      if (c > 0 && w > c) stat.classList.add('overloaded');
+      stat.title = `${w} waiting, ${c} seats`;
+      wrap.appendChild(stat);
+      linesEl.appendChild(wrap);
     } else {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'line-chip';
+      chip.style.background = LINE_COLORS[i % LINE_COLORS.length];
+      chip.dataset.slot = String(i);
+      chip.title = 'available — drag from a station to use';
       chip.disabled = true;
+      linesEl.appendChild(chip);
     }
-    linesEl.appendChild(chip);
   }
   assetsEl.innerHTML = '';
   const items = [
-    ['trains', G.assets.trainsAvailable],
-    ['crossings', G.assets.tunnels],
-    ['carriages', G.assets.carriages],
-    ['interchanges', G.assets.interchanges],
+    ['trains', G.assets.trainsAvailable, 'train'],
+    ['crossings', G.assets.tunnels, null],
+    ['carriages', G.assets.carriages, 'carriage'],
+    ['interchanges', G.assets.interchanges, 'interchange'],
   ];
-  for (const [name, n] of items) {
+  for (const [name, n, kind] of items) {
     const span = document.createElement('span');
-    span.className = 'asset-chip' + (n === 0 ? ' zero' : '');
+    const clickable = n > 0 && kind !== null && G.lines.length > 0;
+    span.className = 'asset-chip' + (n === 0 ? ' zero' : '') + (clickable ? ' clickable' : '');
     span.innerHTML = `${name} <span class="asset-count">${n}</span>`;
+    if (clickable) {
+      span.dataset.kind = kind;
+      span.title = (kind === 'train')       ? 'tap a line to assign a train'
+                 : (kind === 'carriage')    ? 'attach to train with fewest carriages'
+                 : (kind === 'interchange') ? 'place on biggest transfer hub'
+                 : '';
+    }
     assetsEl.appendChild(span);
   }
 }
@@ -1975,10 +2762,12 @@ function refreshHud() {
   if (cashEl) cashEl.textContent = G.mode.creative ? '∞' : `${G.cash}¢`;
   document.getElementById('hud-city').textContent = G.city ? G.city.name : '—';
   document.getElementById('hud-mode').textContent = G.modeId;
-  // clock
+  // clock — defensive guards against NaN/negative time so a transient bad
+  // frame can't kill refreshHud (and thus the whole loop).
   const days = ['mon','tue','wed','thu','fri','sat','sun'];
-  const totalDays = G.time / CFG.SECONDS_PER_DAY;
-  const dayIdx = Math.floor(totalDays) % 7;
+  const safeTime = (typeof G.time === 'number' && isFinite(G.time) && G.time >= 0) ? G.time : 0;
+  const totalDays = safeTime / CFG.SECONDS_PER_DAY;
+  const dayIdx = ((Math.floor(totalDays) % 7) + 7) % 7;
   const hour = Math.floor((totalDays % 1) * 24);
   const minute = Math.floor(((totalDays % 1) * 24 % 1) * 60);
   document.getElementById('hud-day').textContent = days[dayIdx].toUpperCase();
@@ -2082,8 +2871,16 @@ function startGame(cityId, modeId) {
   G._netDirty = true;
   G.drag = null;
   G._tapDown = null;
+  G._tapDownStation = null;
   G.deletePrompt = null;
   G._deletePromptRect = null;
+  G.trainPrompt = null;
+  G._trainPromptHits = null;
+  G._trainPromptRect = null;
+  G.stationPrompt = null;
+  G._stationPromptHits = null;
+  G._stationPromptRect = null;
+  G._activePointerId = undefined;
 
   // creative starts with no preset stations; player places them.
   // other modes: spawn a few starter stations with the three base shapes
@@ -2370,6 +3167,18 @@ function bindMenu() {
     if (!G.running) return;
     if (e.key === 'Escape') {
       // Escape priority: dismiss prompts first, then shop, then pause toggle
+      if (G.stationPrompt) {
+        e.preventDefault();
+        G.stationPrompt = null; G._stationPromptHits = null; G._stationPromptRect = null;
+        if (G.ctx) render();
+        return;
+      }
+      if (G.trainPrompt) {
+        e.preventDefault();
+        G.trainPrompt = null; G._trainPromptHits = null; G._trainPromptRect = null;
+        if (G.ctx) render();
+        return;
+      }
       if (G.deletePrompt) {
         e.preventDefault();
         G.deletePrompt = null; G._deletePromptRect = null;
